@@ -26,7 +26,7 @@ func main() {
 	// Output: world
 	fmt.Println(value["hello"])
 
-	// Note: this currently doesn't encode the data into exactly the same as it got it (non-canonical).
+	// Note: this currently doesn't encode the data exactly the same as it got it (non-canonical).
 	err := enc.Encode(value)
 	if err != nil {
 		panic(err)
