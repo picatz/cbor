@@ -973,7 +973,7 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 		// To reduce allocations, we use a map[int]reflect.Value
 		// to cache the field index and value. This is used to
 		// avoid the need to call rv.FieldByName for each key.
-		fieldCache := make(map[string]reflect.Value)
+		fieldCache := make(map[string]reflect.Value, rv.NumField())
 
 		// We need both caches because we need to support both
 		// `cbor:"1,keyasint"` and `cbor:"name"` tags.
@@ -997,16 +997,14 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 
 			// Check cbor tag for keyasint.
 			if tag, ok := field.Tag.Lookup("cbor"); ok {
-				if strings.HasSuffix(tag, ",keyasint") {
-					// If the tag is "keyasint", add it to the
-					// field keyasint cache with the field index
-					// as the key.
-					fieldCache[strings.TrimSuffix(tag, ",keyasint")] = rv.Field(i)
+				// Use index to avoid allocating a new string.
+				if idx := strings.Index(tag, ",keyasint"); idx != -1 {
+					// If the tag is "keyasint", add it to the field cache.
+					fieldCache[tag[:idx]] = rv.Field(field.Index[0])
 				} else {
-					// If the tag is not "keyasint", add it to
-					// the field name cache with the tag value
-					// as the key.
-					fieldCache[tag] = rv.Field(i)
+					// If the tag is not "keyasint", add it to the field cache
+					// with the tag value as the key.
+					fieldCache[tag] = rv.Field(field.Index[0])
 				}
 			}
 		}
