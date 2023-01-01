@@ -12,6 +12,54 @@ import (
 )
 
 func ExampleDecoder() {
+	const data = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
+
+	var value map[string]string
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		panic(err)
+	}
+
+	// Output: world
+	fmt.Println(value["hello"])
+}
+
+func TestDecoderStructTag(t *testing.T) {
+	const data = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
+
+	type example struct {
+		Hello string `cbor:"hello"`
+	}
+
+	var value example
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		panic(err)
+	}
+
+	// Output: world
+	fmt.Println(value.Hello)
+}
+
+type testStructHello struct {
+	Hello string `cbor:"hello"`
+}
+
+func TestDecoderStruct_tag(t *testing.T) {
+	const cborStream = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
+
+	var value testStructHello
+	err := cbor.NewDecoder(bytes.NewBufferString(cborStream)).Decode(&value)
+	if err != nil {
+		panic(err)
+	}
+
+	if value.Hello != "world" {
+		t.Fatal("expected world, got", value.Hello)
+	}
+}
+
+func TestDecoderMap(t *testing.T) {
 	const cborStream = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
 
 	var value map[string]string
@@ -20,8 +68,9 @@ func ExampleDecoder() {
 		panic(err)
 	}
 
-	// Output: world
-	fmt.Println(value["hello"])
+	if value["hello"] != "world" {
+		t.Fatal("expected world, got", value["hello"])
+	}
 }
 
 func TestDecodeInt(t *testing.T) {

@@ -970,6 +970,72 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 		// including string, int, etc. We support all of these
 		// types.
 
+		// To reduce allocations, we use a map[int]reflect.Value
+		// to cache the field index and value. This is used to
+		// avoid the need to call rv.FieldByName for each key.
+		fieldKeyasintCache := make(map[int]reflect.Value)
+
+		// We also use a map[string]reflect.Value to cache the
+		// field name and value.
+		fieldNameCache := make(map[string]reflect.Value)
+
+		// We need both caches because we need to support both
+		// `cbor:"1,keyasint"` and `cbor:"name"` tags.
+
+		// Get the number of fields in the struct. These are
+		// not the same value as the `keyasint` tag.
+		fieldN := rv.NumField()
+
+		for i := 0; i < fieldN; i++ {
+			field := rv.Type().Field(i)
+
+			// If the field is unexported, skip it.
+			if field.PkgPath != "" {
+				continue
+			}
+
+			// If the field has the "omitempty" tag, skip it.
+			// if _, ok := field.Tag.Lookup("omitempty"); ok {
+			// 	continue
+			// }
+
+			// Check cbor tag for keyasint.
+			if tag, ok := field.Tag.Lookup("cbor"); ok {
+				// Check if the tag is "keyasint".
+				opts := strings.Split(tag, ",")
+				if len(opts) == 0 {
+					continue
+				}
+
+				// Get cbor name (string or int).
+				v := opts[0]
+
+				if len(opts) > 1 {
+					// If opts contains "keyasint", we need to
+					// check if the key matches the field index.
+					for _, opt := range opts[1:] {
+						if opt == "keyasint" {
+							// convert v to int
+							fi, err := strconv.Atoi(v)
+							if err != nil {
+								return fmt.Errorf("invalid keyasint tag value: %s", v)
+							}
+
+							fieldKeyasintCache[fi] = rv.Field(i)
+							continue
+						}
+					}
+				}
+
+				// If the tag is not "keyasint", we need to
+				// check if the key matches the field name.
+				fieldNameCache[v] = rv.Field(i)
+				continue
+			}
+
+			fieldNameCache[field.Name] = rv.Field(i)
+		}
+
 		// For each field in the struct, find the corresponding
 		// key in the map and decode into the field.
 		for i := 0; i < int(n); i++ {
@@ -1014,12 +1080,24 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
 			}
 
-			var fieldName string
+			var ok bool
 
 			switch {
 			case keyStr != "":
-				fv = rv.FieldByName(keyStr)
-				fieldName = keyStr
+				//  type Foo struct {
+				//      Bar string `cbor:"bar"`
+				//  }
+				fv, ok = fieldNameCache[keyStr]
+				if !ok {
+					// If the field is not found in the cache, skip it.
+
+					// Read the value and discard it.
+					if _, err := dec.readValue(); err != nil {
+						return fmt.Errorf("cbor: cannot unmarshal map key into %s: %s", rv.Type().String(), err)
+					}
+
+					continue
+				}
 			case keyInt != 0:
 				// Get the field by struct field tag with matching
 				// "cbor" tag value using the `keyasint` option.
@@ -1028,33 +1106,17 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				//      Bar string `cbor:"1,keyasint"`
 				//  }
 				//
-				fv = rv.FieldByNameFunc(func(name string) bool {
-					f, ok := rv.Type().FieldByName(name)
-					if !ok {
-						return false
-					}
-					tag := f.Tag.Get("cbor")
-					if tag == "" {
-						return false
-					}
-					opts := strings.Split(tag, ",")
-					if len(opts) == 0 {
-						return false
+				fv, ok = fieldKeyasintCache[keyInt]
+				if !ok {
+					// If the field is not found in the cache, skip it.
+
+					// Read the value and discard it.
+					if _, err := dec.readValue(); err != nil {
+						return fmt.Errorf("cbor: cannot unmarshal map key into %s: %s", rv.Type().String(), err)
 					}
 
-					if len(opts) > 1 {
-						// If opts contains "keyasint", we need to
-						// check if the key matches the field index.
-						for _, opt := range opts[1:] {
-							if opt == "keyasint" && opts[0] == strconv.Itoa(keyInt) {
-								fieldName = name
-								return true
-							}
-						}
-					}
-
-					return false
-				})
+					continue
+				}
 			default:
 				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
 			}
@@ -1062,22 +1124,13 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 			// If the field value is not a pointer, we need to create
 			// a pointer to the field value and decode into that.
 			if fv.Kind() != reflect.Ptr {
-				fv = reflect.New(fv.Type())
+				fv = fv.Addr()
 			}
 
 			err = dec.decode(fv)
 			if err != nil {
 				return err
 			}
-
-			// If the field value is a pointer, but the struct field is
-			// not a pointer, we need to dereference the field value.
-			if fv.Kind() == reflect.Ptr && rv.FieldByName(fieldName).Kind() != reflect.Ptr {
-				fv = fv.Elem()
-			}
-
-			// Set value in struct.
-			rv.FieldByName(fieldName).Set(fv)
 		}
 	default:
 		return errors.New("cbor: cannot unmarshal map into " + rv.Type().String())
@@ -1952,15 +2005,21 @@ func (dec *Decoder) readMapKey() (any, error) {
 			return nil, err
 		}
 		return int(n), nil
-	case b >= 0x30 && b <= 0x37:
+	case b >= 0x30 && b <= 0x37: // less than 24 bytes
 		n := int(b & 0x1f)
 
 		return dec.readStringBytes(n)
-	case b >= 0x38 && b <= 0x3f:
+	case b >= 0x38 && b <= 0x3f: // more than 24 bytes (less than 256 bytes)
 		n := int(b & 0x1f)
 
 		return dec.readStringBytes(n)
-	case b == 0x3f:
+	case b == 0x7f: // indefinite length
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	case b == 0x3f: // more than 256 bytes (less than 65536 bytes)
 		n, err := dec.readInt()
 		if err != nil {
 			return nil, err
@@ -1982,7 +2041,71 @@ func (dec *Decoder) readMapKey() (any, error) {
 		return nil, nil
 	case b == 0x40:
 		return false, nil
+	case b >= 0x60 && b <= 0x77: // less than 24 bytes
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b >= 0x78 && b <= 0x7f: // more than 24 bytes (less than 256 bytes)
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	case b == 0x7f: // indefinite length
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
 	default:
 		return nil, fmt.Errorf("cbor: invalid map key: %X", b)
+	}
+}
+
+// readValue reads a value from the CBOR stream.
+func (dec *Decoder) readValue() (any, error) {
+	b, err := dec.readByte()
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case b <= 0x17:
+		return int(b), nil
+	case b >= 0x18 && b <= 0x1f:
+		return int(b & 0x1f), nil
+	case b == 0x20:
+		n, err := dec.readUint16()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b == 0x21:
+		n, err := dec.readUint32()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b == 0x22:
+		n, err := dec.readUint64()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b >= 0x30 && b <= 0x37:
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b >= 0x38 && b <= 0x3f:
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b == 0x3f:
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	default:
+		return nil, fmt.Errorf("cbor: invalid value: %X", b)
 	}
 }
