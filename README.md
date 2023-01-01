@@ -25,5 +25,14 @@ func main() {
 
 	// Output: world
 	fmt.Println(value["hello"])
+
+	// Note: this currently doesn't encode the data into exactly the same as it got it (non-canonical).
+	err := enc.Encode(value)
+	if err != nil {
+		panic(err)
+	}
+
+	// Output: b80278036f6e6501780374776f02
+	fmt.Printf("%x\n", buf.Bytes())
 }
 ```
