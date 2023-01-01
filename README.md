@@ -14,11 +14,15 @@ import (
 	"github.com/picatz/cbor"
 )
 
+// This code shows how to encode and decode the CBOR data format.
 func main() {
-	const cborStream = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
+	// CBOR encoding of the value {"hello": "world"}.
+	const data = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64"
 
+	// Create a new cbor.Decoder using bytes.NewBufferString(data) as its source,
+	// and then Decode the CBOR data into the value map[string]string.
 	var value map[string]string
-	err := cbor.NewDecoder(bytes.NewBufferString(cborStream)).Decode(&value)
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
 	if err != nil {
 		panic(err)
 	}
@@ -26,7 +30,10 @@ func main() {
 	// Output: world
 	fmt.Println(value["hello"])
 
-	// Note: this currently doesn't encode the data exactly the same as it got it (non-canonical).
+	// Encode the value map[string]string using the cbor.NewEncoder.
+	//
+	// Note: this currently doesn't encode the data exactly the same 
+	//       as it got it (non-canonical).
 	err := enc.Encode(value)
 	if err != nil {
 		panic(err)
