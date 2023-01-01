@@ -1,6 +1,7 @@
 package cbor
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -190,6 +191,49 @@ const (
 	TagCBORMIMEMessage Tag = 274
 )
 
+// Unmarshaler is the interface implemented by types that can unmarshal a CBOR
+// description of themselves.
+//
+// The input can be assumed to be a valid encoding of a CBOR value. UnmarshalCBOR
+// must copy the CBOR data if it wishes to retain the data after returning.
+type Unmarshaler interface {
+	UnmarshalCBOR([]byte) error
+}
+
+// Marshaler is the interface implemented by types that can marshal themselves
+// into a CBOR description.
+//
+// MarshalCBOR must copy the CBOR data if it wishes to retain the data after
+// returning.
+type Marshaler interface {
+	MarshalCBOR() ([]byte, error)
+}
+
+// Unmarshall unmarsalls the CBOR-encoded data and stores the result in the value
+// pointed to by v.
+//
+// If v is nil or not a pointer, Unmarshal returns an InvalidUnmarshalError.
+//
+// If v is a pointer to a nil pointer, Unmarshal allocates a new value for it to
+// point to.
+//
+// If v implements the Unmarshaler interface, Unmarshal calls its UnmarshalCBOR
+// method with the CBOR data and returns its error, if any.
+//
+// Otherwise, if the CBOR data is a CBOR array, Unmarshal decodes the CBOR array
+// into the slice pointed to by v. If v is not a pointer to a slice, Unmarshal
+// returns an InvalidUnmarshalError.
+//
+// Otherwise, if the CBOR data is a CBOR map, Unmarshal decodes the CBOR map into
+// the map pointed to by v. If v is not a pointer to a map, Unmarshal returns an
+// InvalidUnmarshalError.
+//
+// Otherwise, Unmarshal decodes the CBOR data into the value pointed to by v. If
+// v is not a pointer, Unmarshal returns an InvalidUnmarshalError.
+func Unmarshal(data []byte, v interface{}) error {
+	return NewDecoder(bytes.NewReader(data)).Decode(v)
+}
+
 // A Decoder reads and decodes CBOR values from an input stream.
 //
 // It is not safe to be called from multiple goroutines.
@@ -203,15 +247,33 @@ type Decoder struct {
 	maxBytes         int
 }
 
+// DefaultMaxValue is the default maximum value for the decoder
+// used for all limits. This is a generous value that should be
+// sufficient for most use cases. If you need to decode larger
+// values, you can increase the limit using the appropriate.
+//
+// If you do not need to decode large values, you can decrease
+// the limit to reduce the memory usage of the decoder. This is
+// also useful for mitigating DoS attacks.
+const DefaultMaxValue = 1000000
+
 // NewDecoder returns a new decoder that reads from r.
 func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{
 		r:                r,
-		maxArrayElements: 1000000,
-		maxMapPairs:      1000000,
-		maxStringBytes:   1000000,
-		maxBytes:         1000000,
+		maxArrayElements: DefaultMaxValue,
+		maxMapPairs:      DefaultMaxValue,
+		maxStringBytes:   DefaultMaxValue,
+		maxBytes:         DefaultMaxValue,
 	}
+}
+
+// SetMax sets all the maximum values to n.
+func (dec *Decoder) SetMax(n int) {
+	dec.maxArrayElements = n
+	dec.maxMapPairs = n
+	dec.maxStringBytes = n
+	dec.maxBytes = n
 }
 
 // SetMaxArrayElements sets the maximum number of elements in an array.
@@ -259,17 +321,18 @@ func (dec *Decoder) SetMaxBytes(n int) {
 // See the documentation for Unmarshal for details about the conversion of
 // a CBOR value into a Go value.
 func (dec *Decoder) Decode(v interface{}) error {
+	// Check that v is a pointer and not nil.
 	rv := reflect.ValueOf(v)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+	if rv.Kind() != reflect.Ptr {
 		return errors.New("cbor: Decode(non-pointer " + rv.Type().String() + ")")
 	}
+	if rv.IsNil() {
+		return errors.New("cbor: Decode(nil " + rv.Type().String() + ")")
+	}
+	// Decode the CBOR value into the value pointed to by v.
 	err := dec.decodeValue(rv.Elem())
 	if err != nil {
-		// If the error is EOF ignore it.
-		if err == io.EOF {
-			return nil
-		}
-		return err
+		return fmt.Errorf("cbor: Decode(%v): %v", rv.Type(), err)
 	}
 	return nil
 }
@@ -278,11 +341,12 @@ func (dec *Decoder) Decode(v interface{}) error {
 //
 // This is the basic building block for all other CBOR decoding.
 func (dec *Decoder) readByte() (byte, error) {
-	var buf [1]byte
-	if _, err := io.ReadFull(dec.r, buf[:]); err != nil {
+	var b [1]byte
+	_, err := io.ReadFull(dec.r, b[:])
+	if err != nil {
 		return 0, err
 	}
-	return buf[0], nil
+	return b[0], nil
 }
 
 // readHeader reads the header byte and returns the major type and additional
@@ -297,10 +361,14 @@ func (dec *Decoder) readHeader() (majorType, additionalInfo byte, err error) {
 
 // decodeValue decodes a CBOR value into the given reflect.Value.
 func (dec *Decoder) decodeValue(rv reflect.Value) error {
+	// Read the header, which contains the major type and additional
+	// information about the value.
 	mt, ai, err := dec.readHeader()
 	if err != nil {
 		return err
 	}
+
+	// Decode the value based on the major type.
 	switch MajorType(mt) {
 	case MajorTypeUnsignedInt:
 		return dec.decodeUint(rv, ai)
@@ -325,6 +393,7 @@ func (dec *Decoder) decodeValue(rv reflect.Value) error {
 
 // decodeSimpleValue decodes a CBOR simple value into the given reflect.Value.
 func (dec *Decoder) decodeSimpleValue(rv reflect.Value, ai byte) error {
+	// Decode the simple value based on the additional information.
 	switch SimpleValue(ai) {
 	case SimpleValueFalse:
 		// If the reflect.Value is a pointer, when we can possibly
@@ -895,6 +964,121 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 			m[key] = val
 		}
 		rv.Set(reflect.ValueOf(m))
+	case reflect.Struct:
+		// Structs are treated similarly to maps, but the keys are
+		// the struct field names. CBOR map keys can be any type,
+		// including string, int, etc. We support all of these
+		// types.
+
+		// For each field in the struct, find the corresponding
+		// key in the map and decode into the field.
+		for i := 0; i < int(n); i++ {
+			key, err := dec.readMapKey()
+			if err != nil {
+				return err
+			}
+
+			var (
+				keyInt int
+				keyStr string
+			)
+
+			// Key can be a string or number. If it's a string,
+			// we can use it directly. If it's a number, we assume
+			// it is the field index.
+			var fv reflect.Value
+			switch key := key.(type) {
+			case string:
+				keyStr = key
+			case int:
+				keyInt = key
+			case int8:
+				keyInt = int(key)
+			case int16:
+				keyInt = int(key)
+			case int32:
+				keyInt = int(key)
+			case int64:
+				keyInt = int(key)
+			case uint:
+				keyInt = int(key)
+			case uint8:
+				keyInt = int(key)
+			case uint16:
+				keyInt = int(key)
+			case uint32:
+				keyInt = int(key)
+			case uint64:
+				keyInt = int(key)
+			default:
+				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
+			}
+
+			var fieldName string
+
+			switch {
+			case keyStr != "":
+				fv = rv.FieldByName(keyStr)
+				fieldName = keyStr
+			case keyInt != 0:
+				// Get the field by struct field tag with matching
+				// "cbor" tag value using the `keyasint` option.
+				//
+				//  type Foo struct {
+				//      Bar string `cbor:"1,keyasint"`
+				//  }
+				//
+				fv = rv.FieldByNameFunc(func(name string) bool {
+					f, ok := rv.Type().FieldByName(name)
+					if !ok {
+						return false
+					}
+					tag := f.Tag.Get("cbor")
+					if tag == "" {
+						return false
+					}
+					opts := strings.Split(tag, ",")
+					if len(opts) == 0 {
+						return false
+					}
+
+					if len(opts) > 1 {
+						// If opts contains "keyasint", we need to
+						// check if the key matches the field index.
+						for _, opt := range opts[1:] {
+							if opt == "keyasint" && opts[0] == strconv.Itoa(keyInt) {
+								fieldName = name
+								return true
+							}
+						}
+					}
+
+					return false
+				})
+			default:
+				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
+			}
+
+			// If the field value is not a pointer, we need to create
+			// a pointer to the field value and decode into that.
+			if fv.Kind() != reflect.Ptr {
+				fv = reflect.New(fv.Type())
+			}
+
+			err = dec.decode(fv)
+			if err != nil {
+				return err
+			}
+
+			// If the field value is a pointer, but the struct field is
+			// not a pointer, we need to dereference the field value.
+			if fv.Kind() == reflect.Ptr && rv.FieldByName(fieldName).Kind() != reflect.Ptr {
+				fv = fv.Elem()
+			}
+
+			// Set value in struct.
+			rv.FieldByName(fieldName).Set(fv)
+		}
 	default:
 		return errors.New("cbor: cannot unmarshal map into " + rv.Type().String())
 	}
@@ -1443,6 +1627,8 @@ func (dec *Decoder) decodeSlice(rv reflect.Value) error {
 	if err != nil {
 		return err
 	}
+	// TODO: add limit.
+
 	// Allocate a new slice.
 	sv := reflect.MakeSlice(rv.Type(), n, n)
 	// Read the slice elements.
@@ -1511,6 +1697,9 @@ func (dec *Decoder) readArrayHeader() (int, error) {
 		return int(b & 0x0f), nil
 	case b == 0x9f:
 		return dec.readInt()
+	case b >= 0x40 && b <= 0x5f: // handle []byte
+		n := int(b & 0x1f)
+		return n, nil
 	default:
 		return 0, fmt.Errorf("cbor: invalid array header: %X", b)
 	}
@@ -1554,6 +1743,25 @@ func (dec *Decoder) readInt() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// Check if unsigned 32-bit integer.
+	if b == 0x1A {
+		n, err := dec.readUint32()
+		if err != nil {
+			return 0, err
+		}
+		return int(n), nil
+	}
+
+	// Check if unsigned 64-bit integer.
+	if b == 0x1B {
+		n, err := dec.readUint64()
+		if err != nil {
+			return 0, err
+		}
+		return int(n), nil
+	}
+
 	switch {
 	case b <= 0x17:
 		return int(b), nil
@@ -1578,7 +1786,7 @@ func (dec *Decoder) readInt() (int, error) {
 		}
 		return int(n), nil
 	default:
-		return 0, errors.New("cbor: invalid integer value")
+		return 0, errors.New("cbor: invalid integer value: " + fmt.Sprintf("%X", b))
 	}
 }
 
@@ -1612,7 +1820,8 @@ func (dec *Decoder) readUint() (uint, error) {
 		}
 		return uint(n), nil
 	default:
-		return 0, errors.New("cbor: invalid integer value")
+		return uint(b), nil
+		// return 0, errors.New("cbor: invalid usigned integer value: " + fmt.Sprintf("%X", b))
 	}
 }
 
@@ -1671,15 +1880,17 @@ func (dec *Decoder) readString() (string, error) {
 		return "", err
 	}
 	switch {
-	case b >= 0x60 && b <= 0x77:
+	case b >= 0x60 && b <= 0x77: // less than 24 bytes
 		n := int(b & 0x1f)
 
 		return dec.readStringBytes(n)
-	case b >= 0x78 && b <= 0x7f:
-		n := int(b & 0x1f)
-
+	case b >= 0x78 && b <= 0x7f: // more than 24 bytes (less than 256 bytes)
+		n, err := dec.readInt()
+		if err != nil {
+			return "", err
+		}
 		return dec.readStringBytes(n)
-	case b == 0x7f:
+	case b == 0x7f: // indefinite length
 		n, err := dec.readInt()
 		if err != nil {
 			return "", err
@@ -1708,4 +1919,70 @@ func (dec *Decoder) readStringBytes(n int) (string, error) {
 		return "", err
 	}
 	return string(buf), nil
+}
+
+// readMapKey reads a map key from the CBOR stream.
+//
+// Used internally by decodeMap for decoding struct fields.
+func (dec *Decoder) readMapKey() (any, error) {
+	b, err := dec.readByte()
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case b <= 0x17:
+		return int(b), nil
+	case b >= 0x18 && b <= 0x1f:
+		return int(b & 0x1f), nil
+	case b == 0x20:
+		n, err := dec.readUint16()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b == 0x21:
+		n, err := dec.readUint32()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b == 0x22:
+		n, err := dec.readUint64()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b >= 0x30 && b <= 0x37:
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b >= 0x38 && b <= 0x3f:
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b == 0x3f:
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	case b == 0xf6: // null string
+		return "", nil
+	case b == 0xf7: // null bytes
+		return []byte{}, nil
+	case b == 0xf8: // null array
+		return []any{}, nil
+	case b == 0xf9: // null map
+		return map[any]any{}, nil
+	case b == 0xfa: // null tag
+		return nil, nil
+	case b == 0xfb: // null simple value
+		return nil, nil
+	case b == 0xff: // null
+		return nil, nil
+	case b == 0x40:
+		return false, nil
+	default:
+		return nil, fmt.Errorf("cbor: invalid map key: %X", b)
+	}
 }
