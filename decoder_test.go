@@ -882,6 +882,24 @@ func TestDecodeCWTClaims(t *testing.T) {
 // BenchmarkUnmarshalCWTClaims-8   	  116292	     10138 ns/op	    2712 B/op	     165 allocs/op
 // PASS
 // ok  	github.com/picatz/cbor	1.367s
+//
+// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
+//
+// goos: darwin
+// goarch: arm64
+// pkg: github.com/picatz/cbor
+// BenchmarkUnmarshalCWTClaims
+// BenchmarkUnmarshalCWTClaims-8   	  697783	      1649 ns/op	     648 B/op	      46 allocs/op
+// PASS
+// ok  	github.com/picatz/cbor	1.314s
+//
+// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
+//
+// goos: darwin
+// goarch: arm64
+// pkg: github.com/picatz/cbor
+// BenchmarkUnmarshalCWTClaims
+// BenchmarkUnmarshalCWTClaims-8   	  692305	      1628 ns/op	     424 B/op	      39 allocs/op
 func BenchmarkUnmarshalCWTClaims(b *testing.B) {
 	b.StopTimer()
 	// Data from https://tools.ietf.org/html/rfc8392#appendix-A section A.1

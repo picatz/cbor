@@ -973,20 +973,14 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 		// To reduce allocations, we use a map[int]reflect.Value
 		// to cache the field index and value. This is used to
 		// avoid the need to call rv.FieldByName for each key.
-		fieldKeyasintCache := make(map[int]reflect.Value)
-
-		// We also use a map[string]reflect.Value to cache the
-		// field name and value.
-		fieldNameCache := make(map[string]reflect.Value)
+		fieldCache := make(map[string]reflect.Value)
 
 		// We need both caches because we need to support both
 		// `cbor:"1,keyasint"` and `cbor:"name"` tags.
 
-		// Get the number of fields in the struct. These are
-		// not the same value as the `keyasint` tag.
-		fieldN := rv.NumField()
-
-		for i := 0; i < fieldN; i++ {
+		// Iterate over the map fields in the struct to build
+		// a cache of field names and keyasint values.
+		for i := 0; i < rv.NumField(); i++ {
 			field := rv.Type().Field(i)
 
 			// If the field is unexported, skip it.
@@ -994,46 +988,27 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				continue
 			}
 
-			// If the field has the "omitempty" tag, skip it.
-			// if _, ok := field.Tag.Lookup("omitempty"); ok {
-			// 	continue
-			// }
-
-			// Check cbor tag for keyasint.
-			if tag, ok := field.Tag.Lookup("cbor"); ok {
-				// Check if the tag is "keyasint".
-				opts := strings.Split(tag, ",")
-				if len(opts) == 0 {
-					continue
-				}
-
-				// Get cbor name (string or int).
-				v := opts[0]
-
-				if len(opts) > 1 {
-					// If opts contains "keyasint", we need to
-					// check if the key matches the field index.
-					for _, opt := range opts[1:] {
-						if opt == "keyasint" {
-							// convert v to int
-							fi, err := strconv.Atoi(v)
-							if err != nil {
-								return fmt.Errorf("invalid keyasint tag value: %s", v)
-							}
-
-							fieldKeyasintCache[fi] = rv.Field(i)
-							continue
-						}
-					}
-				}
-
-				// If the tag is not "keyasint", we need to
-				// check if the key matches the field name.
-				fieldNameCache[v] = rv.Field(i)
+			// If the field has no cbor tag, add it to the
+			// field name cache with the field name as the key.
+			if field.Tag == "" {
+				fieldCache[field.Name] = rv.Field(i)
 				continue
 			}
 
-			fieldNameCache[field.Name] = rv.Field(i)
+			// Check cbor tag for keyasint.
+			if tag, ok := field.Tag.Lookup("cbor"); ok {
+				if strings.HasSuffix(tag, ",keyasint") {
+					// If the tag is "keyasint", add it to the
+					// field keyasint cache with the field index
+					// as the key.
+					fieldCache[strings.TrimSuffix(tag, ",keyasint")] = rv.Field(i)
+				} else {
+					// If the tag is not "keyasint", add it to
+					// the field name cache with the tag value
+					// as the key.
+					fieldCache[tag] = rv.Field(i)
+				}
+			}
 		}
 
 		// For each field in the struct, find the corresponding
@@ -1044,81 +1019,18 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				return err
 			}
 
-			var (
-				keyInt int
-				keyStr string
-			)
+			keyStr := fmt.Sprintf("%v", key)
 
-			// Key can be a string or number. If it's a string,
-			// we can use it directly. If it's a number, we assume
-			// it is the field index.
-			var fv reflect.Value
-			switch key := key.(type) {
-			case string:
-				keyStr = key
-			case int:
-				keyInt = key
-			case int8:
-				keyInt = int(key)
-			case int16:
-				keyInt = int(key)
-			case int32:
-				keyInt = int(key)
-			case int64:
-				keyInt = int(key)
-			case uint:
-				keyInt = int(key)
-			case uint8:
-				keyInt = int(key)
-			case uint16:
-				keyInt = int(key)
-			case uint32:
-				keyInt = int(key)
-			case uint64:
-				keyInt = int(key)
-			default:
-				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
-			}
+			fv, ok := fieldCache[keyStr]
+			if !ok {
+				// If the field is not found in the cache, skip it.
 
-			var ok bool
-
-			switch {
-			case keyStr != "":
-				//  type Foo struct {
-				//      Bar string `cbor:"bar"`
-				//  }
-				fv, ok = fieldNameCache[keyStr]
-				if !ok {
-					// If the field is not found in the cache, skip it.
-
-					// Read the value and discard it.
-					if _, err := dec.readValue(); err != nil {
-						return fmt.Errorf("cbor: cannot unmarshal map key into %s: %s", rv.Type().String(), err)
-					}
-
-					continue
+				// Read the value and discard it.
+				if _, err := dec.readValue(); err != nil {
+					return fmt.Errorf("cbor: cannot unmarshal map key into %s: %s", rv.Type().String(), err)
 				}
-			case keyInt != 0:
-				// Get the field by struct field tag with matching
-				// "cbor" tag value using the `keyasint` option.
-				//
-				//  type Foo struct {
-				//      Bar string `cbor:"1,keyasint"`
-				//  }
-				//
-				fv, ok = fieldKeyasintCache[keyInt]
-				if !ok {
-					// If the field is not found in the cache, skip it.
 
-					// Read the value and discard it.
-					if _, err := dec.readValue(); err != nil {
-						return fmt.Errorf("cbor: cannot unmarshal map key into %s: %s", rv.Type().String(), err)
-					}
-
-					continue
-				}
-			default:
-				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
+				continue
 			}
 
 			// If the field value is not a pointer, we need to create
