@@ -1017,7 +1017,7 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				return err
 			}
 
-			keyStr := fmt.Sprintf("%v", key)
+			keyStr := toString(key)
 
 			fv, ok := fieldCache[keyStr]
 			if !ok {
@@ -1969,6 +1969,50 @@ func (dec *Decoder) readMapKey() (any, error) {
 		return dec.readStringBytes(n)
 	default:
 		return nil, fmt.Errorf("cbor: invalid map key: %X", b)
+	}
+}
+
+// toString converts any Go value to a string as fast as possible
+// while avoiding allocations.
+func toString(v any) string {
+	switch v := v.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case int:
+		return strconv.Itoa(v)
+	case int8:
+		return strconv.Itoa(int(v))
+	case int16:
+		return strconv.Itoa(int(v))
+	case int32:
+		return strconv.Itoa(int(v))
+	case int64:
+		return strconv.Itoa(int(v))
+	case uint:
+		return strconv.Itoa(int(v))
+	case uint8:
+		return strconv.Itoa(int(v))
+	case uint16:
+		return strconv.Itoa(int(v))
+	case uint32:
+		return strconv.Itoa(int(v))
+	case uint64:
+		return strconv.Itoa(int(v))
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprintf("%v", v)
 	}
 }
 
