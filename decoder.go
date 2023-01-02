@@ -241,13 +241,19 @@ type Decoder struct {
 	// contains filtered or unexported fields
 	r io.Reader
 
+	// buf is a buffer used to read major type
+	// data from the underlying reader.
 	buf [1]byte
 
+	// buffer is a buffer used to read all other
+	// data from the underlying reader.
 	buffer []byte
 
-	Options *DecoderOptions
+	// options is the decoder options.
+	options *DecoderOptions
 }
 
+// Decoder options.
 type DecoderOptions struct {
 	MaxArrayElements int
 	MaxMapPairs      int
@@ -255,6 +261,8 @@ type DecoderOptions struct {
 	MaxBytes         int
 }
 
+// DefaultDecoderOptions is the default decoder options used
+// by the decoder.
 var DefaultDecoderOptions = DecoderOptions{
 	MaxArrayElements: DefaultMaxValue,
 	MaxMapPairs:      DefaultMaxValue,
@@ -274,25 +282,19 @@ const DefaultMaxValue = 10_000
 
 // NewDecoder returns a new decoder that reads from r.
 func NewDecoder(r io.Reader) *Decoder {
-	// if the reader is a ByteReader, use it directly because it is
-	// more efficient than using bufio.Reader.
-	// if _, ok := r.(io.ByteReader); !ok {
-	// 	r = bufio.NewReader(r)
-	// }
-
 	return &Decoder{
 		r:       r,
 		buffer:  make([]byte, 0, 512), // 512 is the default bufio size
-		Options: &DefaultDecoderOptions,
+		options: &DefaultDecoderOptions,
 	}
 }
 
 // SetMax sets all the maximum values to n.
 func (dec *Decoder) SetMax(n int) {
-	dec.Options.MaxArrayElements = n
-	dec.Options.MaxMapPairs = n
-	dec.Options.MaxStringBytes = n
-	dec.Options.MaxBytes = n
+	dec.options.MaxArrayElements = n
+	dec.options.MaxMapPairs = n
+	dec.options.MaxStringBytes = n
+	dec.options.MaxBytes = n
 }
 
 // SetMaxArrayElements sets the maximum number of elements in an array.
@@ -302,7 +304,7 @@ func (dec *Decoder) SetMax(n int) {
 //
 // The default limit is 10,000.
 func (dec *Decoder) SetMaxArrayElements(n int) {
-	dec.Options.MaxArrayElements = n
+	dec.options.MaxArrayElements = n
 }
 
 // SetMaxMapPairs sets the maximum number of pairs in a map.
@@ -311,7 +313,7 @@ func (dec *Decoder) SetMaxArrayElements(n int) {
 //
 // The default limit is 10,000.
 func (dec *Decoder) SetMaxMapPairs(n int) {
-	dec.Options.MaxMapPairs = n
+	dec.options.MaxMapPairs = n
 }
 
 // SetMaxStringBytes sets the maximum number of bytes in a string.
@@ -321,7 +323,7 @@ func (dec *Decoder) SetMaxMapPairs(n int) {
 //
 // The default limit is 10,000.
 func (dec *Decoder) SetMaxStringBytes(n int) {
-	dec.Options.MaxStringBytes = n
+	dec.options.MaxStringBytes = n
 }
 
 // SetMaxBytes sets the maximum number of bytes in a byte string.
@@ -331,7 +333,7 @@ func (dec *Decoder) SetMaxStringBytes(n int) {
 //
 // The default limit is 10,000.
 func (dec *Decoder) SetMaxBytes(n int) {
-	dec.Options.MaxBytes = n
+	dec.options.MaxBytes = n
 }
 
 // Decode reads the next CBOR-encoded value from its input and stores
@@ -342,17 +344,16 @@ func (dec *Decoder) SetMaxBytes(n int) {
 func (dec *Decoder) Decode(v interface{}) error {
 	// Check that v is a pointer and not nil.
 	rv := reflect.ValueOf(v)
-	if rv.Kind() != reflect.Ptr {
-		return errors.New("cbor: Decode(non-pointer " + rv.Type().String() + ")")
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("cbor: Decode(non-pointer %s)", rv.Type())
 	}
-	if rv.IsNil() {
-		return errors.New("cbor: Decode(nil " + rv.Type().String() + ")")
-	}
+
 	// Decode the CBOR value into the value pointed to by v.
 	err := dec.decodeValue(rv.Elem())
 	if err != nil {
 		return fmt.Errorf("cbor: Decode(%v): %v", rv.Type(), err)
 	}
+
 	return nil
 }
 
@@ -369,12 +370,12 @@ func (dec *Decoder) readByte() (byte, error) {
 
 // readHeader reads the header byte and returns the major type and additional
 // information. This is called before obtaining the value of a CBOR item.
-func (dec *Decoder) readHeader() (majorType, additionalInfo byte, err error) {
+func (dec *Decoder) readHeader() (majorType MajorType, additionalInfo byte, err error) {
 	b, err := dec.readByte()
 	if err != nil {
 		return 0, 0, err
 	}
-	return b >> 5, b & 0x1f, nil
+	return MajorType(b >> 5), b & 0x1f, nil
 }
 
 // decodeValue decodes a CBOR value into the given reflect.Value.
@@ -652,7 +653,7 @@ func (dec *Decoder) decodeBytes(rv reflect.Value, ai byte) error {
 		return errors.New("cbor: byte string too long")
 	}
 
-	if n > uint64(dec.Options.MaxBytes) {
+	if n > uint64(dec.options.MaxBytes) {
 		return errors.New("cbor: byte string too long")
 	}
 
@@ -748,7 +749,7 @@ func (dec *Decoder) decodeArray(rv reflect.Value, ai byte) error {
 		return err
 	}
 
-	if n > uint64(dec.Options.MaxArrayElements) {
+	if n > uint64(dec.options.MaxArrayElements) {
 		return errors.New("cbor: array too long")
 	}
 
@@ -1639,7 +1640,7 @@ func (dec *Decoder) decodeSlice(rv reflect.Value) error {
 		return err
 	}
 
-	if n > dec.Options.MaxArrayElements {
+	if n > dec.options.MaxArrayElements {
 		return errors.New("cbor: slice (array) too large")
 	}
 
@@ -1935,7 +1936,7 @@ func (dec *Decoder) readStringBytes(n int) (string, error) {
 	}
 
 	// Check that the string is not too large.
-	if n > dec.Options.MaxStringBytes {
+	if n > dec.options.MaxStringBytes {
 		return "", fmt.Errorf("cbor: string too large: %d bytes", n)
 	}
 
