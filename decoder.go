@@ -501,7 +501,6 @@ func (dec *Decoder) decodeUint(rv reflect.Value, ai byte) error {
 		n   uint64
 		err error
 	)
-
 	switch ai {
 	case 24:
 		n, err = dec.readUint8()
@@ -701,11 +700,24 @@ func (dec *Decoder) decodeString(rv reflect.Value, ai byte) error {
 	if n > math.MaxInt32 {
 		return errors.New("cbor: string too long")
 	}
-	// TODO: add a configurable limit to the maximum string length
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(dec.r, buf); err != nil {
+	if n > uint64(dec.options.MaxStringBytes) {
+		return errors.New("cbor: string too long")
+	}
+
+	// Reuse dec.buffer if it's large enough.
+	if cap(dec.buffer) < int(n) {
+		dec.buffer = make([]byte, n)
+	}
+	buf := dec.buffer[:n]
+
+	_, err = dec.r.Read(buf)
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return err
 	}
+
 	switch rv.Kind() {
 	case reflect.String:
 		rv.SetString(string(buf))

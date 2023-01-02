@@ -927,6 +927,28 @@ func TestDecodeCWTClaims(t *testing.T) {
 	}
 }
 
+// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalString$ github.com/picatz/cbor -v
+//
+// goos: darwin
+// goarch: arm64
+// pkg: github.com/picatz/cbor
+// BenchmarkUnmarshalString
+// BenchmarkUnmarshalString-8   	 5436266	       185.9 ns/op	     656 B/op	       5 allocs/op
+func BenchmarkUnmarshalString(b *testing.B) {
+	data, err := hex.DecodeString("6B68656C6C6F20776F726C64")
+	if err != nil {
+		b.Fatal("hex.DecodeString:", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var v string
+		if err := cbor.Unmarshal(data, &v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
 //
 // goos: darwin
@@ -936,6 +958,8 @@ func TestDecodeCWTClaims(t *testing.T) {
 // BenchmarkUnmarshalCWTClaims-8   	  810913	      1276 ns/op	     856 B/op	      16 allocs/op
 func BenchmarkUnmarshalCWTClaims(b *testing.B) {
 	// Data from https://tools.ietf.org/html/rfc8392#appendix-A section A.1
+	//
+	// {1: "coap://as.example.com", 2: "erikw", 3: "coap://light.example.com", 4: 1444064944, 5: 1443944944, 6: 1443944944, 7: h'0B71'}
 	data, err := hex.DecodeString("a70175636f61703a2f2f61732e6578616d706c652e636f6d02656572696b77037818636f61703a2f2f6c696768742e6578616d706c652e636f6d041a5612aeb0051a5610d9f0061a5610d9f007420b71")
 	if err != nil {
 		b.Fatal("hex.DecodeString:", err)
