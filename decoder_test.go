@@ -115,6 +115,62 @@ func TestDecodeInt64(t *testing.T) {
 	}
 }
 
+func TestDecodeUInt(t *testing.T) {
+	data := "\x01"
+
+	var value uint
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
+func TestDecodeUIntPointer(t *testing.T) {
+	data := "\x01"
+
+	var value *uint
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if *value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
+func TestDecodeUInt32(t *testing.T) {
+	data := "\x01"
+
+	var value uint32
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
+func TestDecodeUInt32Pointer(t *testing.T) {
+	data := "\x01"
+
+	var value *uint32
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if *value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
 func TestDecodeInt64Pointer(t *testing.T) {
 	data := "\x01"
 

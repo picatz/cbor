@@ -3,6 +3,7 @@ package cbor
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -579,7 +580,8 @@ func (dec *Decoder) readUint32() (uint64, error) {
 		}
 		return 0, err
 	}
-	return uint64(buf[0])<<24 | uint64(buf[1])<<16 | uint64(buf[2])<<8 | uint64(buf[3]), nil
+
+	return uint64(binary.BigEndian.Uint32(buf)), nil
 }
 
 // readUint64 reads a 64-bit unsigned integer from the input stream.
@@ -595,8 +597,8 @@ func (dec *Decoder) readUint64() (uint64, error) {
 		}
 		return 0, err
 	}
-	return uint64(buf[0])<<56 | uint64(buf[1])<<48 | uint64(buf[2])<<40 | uint64(buf[3])<<32 |
-		uint64(buf[4])<<24 | uint64(buf[5])<<16 | uint64(buf[6])<<8 | uint64(buf[7]), nil
+
+	return binary.BigEndian.Uint64(buf), nil
 }
 
 // decodeInt decodes a CBOR negative integer into the given reflect.Value.
@@ -1036,7 +1038,7 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 			}
 
 			// Check cbor tag for keyasint.
-			if tag, ok := field.Tag.Lookup("cbor"); ok {
+			if tag := field.Tag.Get("cbor"); tag != "" {
 				// Use index to avoid allocating a new string.
 				if idx := strings.Index(tag, ",keyasint"); idx != -1 {
 					// If the tag is "keyasint", add it to the field cache.
@@ -1618,11 +1620,11 @@ func (dec *Decoder) decodeStruct(rv reflect.Value) error {
 		}
 
 		fv := rv.FieldByNameFunc(func(name string) bool {
-			return strings.EqualFold(name, key)
+			return bytes.EqualFold([]byte(name), []byte(key))
 		})
 
 		if !fv.IsValid() {
-			return errors.New("cbor: unknown field " + key)
+			return errors.New("cbor: unknown field " + string(key))
 		}
 
 		if err := dec.decode(fv.Addr()); err != nil {
@@ -1699,7 +1701,7 @@ func (dec *Decoder) decodeBasic(rv reflect.Value) error {
 		if err != nil {
 			return err
 		}
-		rv.SetString(s)
+		rv.SetString(string(s))
 	case reflect.Interface:
 		if rv.NumMethod() != 0 {
 			return errors.New("cbor: cannot unmarshal into non-empty interface " + rv.Type().String())
@@ -1899,10 +1901,10 @@ func (dec *Decoder) readFloat64() (float64, error) {
 }
 
 // readString reads a string value from the CBOR stream.
-func (dec *Decoder) readString() (string, error) {
+func (dec *Decoder) readString() ([]byte, error) {
 	b, err := dec.readByte()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	switch {
 	case b >= 0x60 && b <= 0x77: // less than 24 bytes
@@ -1912,32 +1914,32 @@ func (dec *Decoder) readString() (string, error) {
 	case b >= 0x78 && b <= 0x7f: // more than 24 bytes (less than 256 bytes)
 		n, err := dec.readInt()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		return dec.readStringBytes(n)
 	case b == 0x7f: // indefinite length (TODO: verify this is correct)
 		n, err := dec.readInt()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		return dec.readStringBytes(n)
 	case b == 0xf6: // null string
-		return "", nil
+		return nil, nil
 	default:
-		return "", fmt.Errorf("cbor: invalid string value: %X", b)
+		return nil, fmt.Errorf("cbor: invalid string value: %X", b)
 	}
 }
 
 // readStringBytes reads a string value from the CBOR stream.
-func (dec *Decoder) readStringBytes(n int) (string, error) {
+func (dec *Decoder) readStringBytes(n int) ([]byte, error) {
 	// Check that the string is not empty.
 	if n == 0 {
-		return "", nil
+		return nil, nil
 	}
 
 	// Check that the string is not too large.
 	if n > dec.options.MaxStringBytes {
-		return "", fmt.Errorf("cbor: string too large: %d bytes", n)
+		return nil, fmt.Errorf("cbor: string too large: %d bytes", n)
 	}
 
 	// Ensure that the buffer has sufficient capacity
@@ -1952,12 +1954,12 @@ func (dec *Decoder) readStringBytes(n int) (string, error) {
 	_, err := dec.r.Read(buf)
 	if err != nil {
 		if err == io.EOF {
-			return "", io.ErrUnexpectedEOF
+			return nil, io.ErrUnexpectedEOF
 		}
-		return "", err
+		return nil, err
 	}
 
-	return string(buf), nil
+	return buf, nil
 }
 
 // readMapKey reads a map key from the CBOR stream.
