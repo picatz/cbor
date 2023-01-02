@@ -553,7 +553,7 @@ func (dec *Decoder) readUint8() (uint64, error) {
 // readUint16 reads a 16-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint16() (uint64, error) {
 	// Reuse dec.buffer if it's large enough.
-	if len(dec.buffer) < 2 {
+	if cap(dec.buffer) < 2 {
 		dec.buffer = make([]byte, 2)
 	}
 	buf := dec.buffer[:2]
@@ -569,7 +569,7 @@ func (dec *Decoder) readUint16() (uint64, error) {
 // readUint32 reads a 32-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint32() (uint64, error) {
 	// Reuse dec.buffer if it's large enough.
-	if len(dec.buffer) < 4 {
+	if cap(dec.buffer) < 4 {
 		dec.buffer = make([]byte, 4)
 	}
 	buf := dec.buffer[:4]
@@ -585,7 +585,7 @@ func (dec *Decoder) readUint32() (uint64, error) {
 // readUint64 reads a 64-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint64() (uint64, error) {
 	// Reuse dec.buffer if it's large enough.
-	if len(dec.buffer) < 8 {
+	if cap(dec.buffer) < 8 {
 		dec.buffer = make([]byte, 8)
 	}
 	buf := dec.buffer[:8]
