@@ -242,8 +242,8 @@ type Decoder struct {
 	// contains filtered or unexported fields
 	r io.Reader
 
-	// buf is a buffer used to read major type
-	// data from the underlying reader.
+	// buf is a buffer used to read single bytes from
+	// the underlying reader.
 	buf [1]byte
 
 	// buffer is a buffer used to read all other
