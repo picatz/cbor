@@ -12,6 +12,54 @@ import (
 )
 
 func ExampleDecoder() {
+	const data = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
+
+	var value map[string]string
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		panic(err)
+	}
+
+	// Output: world
+	fmt.Println(value["hello"])
+}
+
+func TestDecoderStructTag(t *testing.T) {
+	const data = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
+
+	type example struct {
+		Hello string `cbor:"hello"`
+	}
+
+	var value example
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		panic(err)
+	}
+
+	// Output: world
+	fmt.Println(value.Hello)
+}
+
+type testStructHello struct {
+	Hello string `cbor:"hello"`
+}
+
+func TestDecoderStruct_tag(t *testing.T) {
+	const cborStream = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
+
+	var value testStructHello
+	err := cbor.NewDecoder(bytes.NewBufferString(cborStream)).Decode(&value)
+	if err != nil {
+		panic(err)
+	}
+
+	if value.Hello != "world" {
+		t.Fatal("expected world, got", value.Hello)
+	}
+}
+
+func TestDecoderMap(t *testing.T) {
 	const cborStream = "\xA1\x65\x68\x65\x6C\x6C\x6F\x65\x77\x6F\x72\x6C\x64" // {"hello": "world"}
 
 	var value map[string]string
@@ -20,8 +68,9 @@ func ExampleDecoder() {
 		panic(err)
 	}
 
-	// Output: world
-	fmt.Println(value["hello"])
+	if value["hello"] != "world" {
+		t.Fatal("expected world, got", value["hello"])
+	}
 }
 
 func TestDecodeInt(t *testing.T) {
@@ -62,6 +111,62 @@ func TestDecodeInt64(t *testing.T) {
 	}
 
 	if value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
+func TestDecodeUInt(t *testing.T) {
+	data := "\x01"
+
+	var value uint
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
+func TestDecodeUIntPointer(t *testing.T) {
+	data := "\x01"
+
+	var value *uint
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if *value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
+func TestDecodeUInt32(t *testing.T) {
+	data := "\x01"
+
+	var value uint32
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if value != 1 {
+		t.Fatal("expected 1, got", value)
+	}
+}
+
+func TestDecodeUInt32Pointer(t *testing.T) {
+	data := "\x01"
+
+	var value *uint32
+	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if *value != 1 {
 		t.Fatal("expected 1, got", value)
 	}
 }
@@ -759,9 +864,7 @@ var benchDecodeMalformedValue []uint8
 // goarch: arm64
 // pkg: github.com/picatz/cbor
 // BenchmarkDecodeMalformed
-// BenchmarkDecodeMalformed-8   	12116209	        94.26 ns/op	     128 B/op	       5 allocs/op
-// PASS
-// ok  	github.com/picatz/cbor	1.417s
+// BenchmarkDecodeMalformed-8   	 4152103	       289.8 ns/op	     712 B/op	       7 allocs/op
 func BenchmarkDecodeMalformed(b *testing.B) {
 	// This is a malformed CBOR data stream.
 	data := []byte{0x9B, 0x00, 0x00, 0x42, 0xFA, 0x42, 0xFA, 0x42, 0xFA, 0x42} // designed to cause an error (large array)
@@ -824,53 +927,48 @@ func TestDecodeCWTClaims(t *testing.T) {
 	}
 }
 
-// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
+// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalString$ github.com/picatz/cbor -v
 //
 // goos: darwin
 // goarch: arm64
 // pkg: github.com/picatz/cbor
-// BenchmarkUnmarshalCWTClaims
-// BenchmarkUnmarshalCWTClaims-8   	  116292	     10138 ns/op	    2712 B/op	     165 allocs/op
-// PASS
-// ok  	github.com/picatz/cbor	1.367s
-func BenchmarkUnmarshalCWTClaims(b *testing.B) {
-	b.StopTimer()
-	// Data from https://tools.ietf.org/html/rfc8392#appendix-A section A.1
-	data, err := hex.DecodeString("a70175636f61703a2f2f61732e6578616d706c652e636f6d02656572696b77037818636f61703a2f2f6c696768742e6578616d706c652e636f6d041a5612aeb0051a5610d9f0061a5610d9f007420b71")
+// BenchmarkUnmarshalString
+// BenchmarkUnmarshalString-8   	 5436266	       185.9 ns/op	     656 B/op	       5 allocs/op
+func BenchmarkUnmarshalString(b *testing.B) {
+	data, err := hex.DecodeString("6B68656C6C6F20776F726C64")
 	if err != nil {
 		b.Fatal("hex.DecodeString:", err)
 	}
 
-	b.StartTimer()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		var v claims
+		var v string
 		if err := cbor.Unmarshal(data, &v); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// $ go test -benchmem -run=^$ -bench ^BenchmarkDecodeCWTClaims$ github.com/picatz/cbor -v
+// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
 //
 // goos: darwin
 // goarch: arm64
 // pkg: github.com/picatz/cbor
-// BenchmarkDecodeCWTClaims
-// BenchmarkDecodeCWTClaims-8   	  116398	     10221 ns/op	    2712 B/op	     165 allocs/op
-// PASS
-// ok  	github.com/picatz/cbor	1.385s
-func BenchmarkDecodeCWTClaims(b *testing.B) {
-	b.StopTimer()
+// BenchmarkUnmarshalCWTClaims
+// BenchmarkUnmarshalCWTClaims-8   	  810913	      1276 ns/op	     856 B/op	      16 allocs/op
+func BenchmarkUnmarshalCWTClaims(b *testing.B) {
 	// Data from https://tools.ietf.org/html/rfc8392#appendix-A section A.1
+	//
+	// {1: "coap://as.example.com", 2: "erikw", 3: "coap://light.example.com", 4: 1444064944, 5: 1443944944, 6: 1443944944, 7: h'0B71'}
 	data, err := hex.DecodeString("a70175636f61703a2f2f61732e6578616d706c652e636f6d02656572696b77037818636f61703a2f2f6c696768742e6578616d706c652e636f6d041a5612aeb0051a5610d9f0061a5610d9f007420b71")
 	if err != nil {
 		b.Fatal("hex.DecodeString:", err)
 	}
 
-	b.StartTimer()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var v claims
-		if err := cbor.NewDecoder(bytes.NewReader(data)).Decode(&v); err != nil {
+		if err := cbor.Unmarshal(data, &v); err != nil {
 			b.Fatal(err)
 		}
 	}

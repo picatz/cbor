@@ -3,6 +3,7 @@ package cbor
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -241,10 +242,33 @@ type Decoder struct {
 	// contains filtered or unexported fields
 	r io.Reader
 
-	maxArrayElements int
-	maxMapPairs      int
-	maxStringBytes   int
-	maxBytes         int
+	// buf is a buffer used to read major type
+	// data from the underlying reader.
+	buf [1]byte
+
+	// buffer is a buffer used to read all other
+	// data from the underlying reader.
+	buffer []byte
+
+	// options is the decoder options.
+	options *DecoderOptions
+}
+
+// Decoder options.
+type DecoderOptions struct {
+	MaxArrayElements int
+	MaxMapPairs      int
+	MaxStringBytes   int
+	MaxBytes         int
+}
+
+// DefaultDecoderOptions is the default decoder options used
+// by the decoder.
+var DefaultDecoderOptions = DecoderOptions{
+	MaxArrayElements: DefaultMaxValue,
+	MaxMapPairs:      DefaultMaxValue,
+	MaxStringBytes:   DefaultMaxValue,
+	MaxBytes:         DefaultMaxValue,
 }
 
 // DefaultMaxValue is the default maximum value for the decoder
@@ -255,25 +279,23 @@ type Decoder struct {
 // If you do not need to decode large values, you can decrease
 // the limit to reduce the memory usage of the decoder. This is
 // also useful for mitigating DoS attacks.
-const DefaultMaxValue = 1000000
+const DefaultMaxValue = 10_000
 
 // NewDecoder returns a new decoder that reads from r.
 func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{
-		r:                r,
-		maxArrayElements: DefaultMaxValue,
-		maxMapPairs:      DefaultMaxValue,
-		maxStringBytes:   DefaultMaxValue,
-		maxBytes:         DefaultMaxValue,
+		r:       r,
+		buffer:  make([]byte, 0, 512), // 512 is the default bufio size
+		options: &DefaultDecoderOptions,
 	}
 }
 
 // SetMax sets all the maximum values to n.
 func (dec *Decoder) SetMax(n int) {
-	dec.maxArrayElements = n
-	dec.maxMapPairs = n
-	dec.maxStringBytes = n
-	dec.maxBytes = n
+	dec.options.MaxArrayElements = n
+	dec.options.MaxMapPairs = n
+	dec.options.MaxStringBytes = n
+	dec.options.MaxBytes = n
 }
 
 // SetMaxArrayElements sets the maximum number of elements in an array.
@@ -281,18 +303,18 @@ func (dec *Decoder) SetMax(n int) {
 // If the number of elements in an array exceeds this limit, an error is
 // returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxArrayElements(n int) {
-	dec.maxArrayElements = n
+	dec.options.MaxArrayElements = n
 }
 
 // SetMaxMapPairs sets the maximum number of pairs in a map.
 //
 // If the number of pairs in a map exceeds this limit, an error is returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxMapPairs(n int) {
-	dec.maxMapPairs = n
+	dec.options.MaxMapPairs = n
 }
 
 // SetMaxStringBytes sets the maximum number of bytes in a string.
@@ -300,9 +322,9 @@ func (dec *Decoder) SetMaxMapPairs(n int) {
 // If the number of bytes in a string exceeds this limit, an error is
 // returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxStringBytes(n int) {
-	dec.maxStringBytes = n
+	dec.options.MaxStringBytes = n
 }
 
 // SetMaxBytes sets the maximum number of bytes in a byte string.
@@ -310,9 +332,9 @@ func (dec *Decoder) SetMaxStringBytes(n int) {
 // If the number of bytes in a byte string exceeds this limit, an error is
 // returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxBytes(n int) {
-	dec.maxBytes = n
+	dec.options.MaxBytes = n
 }
 
 // Decode reads the next CBOR-encoded value from its input and stores
@@ -323,17 +345,16 @@ func (dec *Decoder) SetMaxBytes(n int) {
 func (dec *Decoder) Decode(v interface{}) error {
 	// Check that v is a pointer and not nil.
 	rv := reflect.ValueOf(v)
-	if rv.Kind() != reflect.Ptr {
-		return errors.New("cbor: Decode(non-pointer " + rv.Type().String() + ")")
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("cbor: Decode(non-pointer %s)", rv.Type())
 	}
-	if rv.IsNil() {
-		return errors.New("cbor: Decode(nil " + rv.Type().String() + ")")
-	}
+
 	// Decode the CBOR value into the value pointed to by v.
 	err := dec.decodeValue(rv.Elem())
 	if err != nil {
 		return fmt.Errorf("cbor: Decode(%v): %v", rv.Type(), err)
 	}
+
 	return nil
 }
 
@@ -341,22 +362,21 @@ func (dec *Decoder) Decode(v interface{}) error {
 //
 // This is the basic building block for all other CBOR decoding.
 func (dec *Decoder) readByte() (byte, error) {
-	var b [1]byte
-	_, err := io.ReadFull(dec.r, b[:])
+	_, err := dec.r.Read(dec.buf[:])
 	if err != nil {
 		return 0, err
 	}
-	return b[0], nil
+	return dec.buf[0], nil
 }
 
 // readHeader reads the header byte and returns the major type and additional
 // information. This is called before obtaining the value of a CBOR item.
-func (dec *Decoder) readHeader() (majorType, additionalInfo byte, err error) {
+func (dec *Decoder) readHeader() (majorType MajorType, additionalInfo byte, err error) {
 	b, err := dec.readByte()
 	if err != nil {
 		return 0, 0, err
 	}
-	return b >> 5, b & 0x1f, nil
+	return MajorType(b >> 5), b & 0x1f, nil
 }
 
 // decodeValue decodes a CBOR value into the given reflect.Value.
@@ -481,7 +501,6 @@ func (dec *Decoder) decodeUint(rv reflect.Value, ai byte) error {
 		n   uint64
 		err error
 	)
-
 	switch ai {
 	case 24:
 		n, err = dec.readUint8()
@@ -533,8 +552,15 @@ func (dec *Decoder) readUint8() (uint64, error) {
 
 // readUint16 reads a 16-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint16() (uint64, error) {
-	var buf [2]byte
-	if _, err := io.ReadFull(dec.r, buf[:]); err != nil {
+	// Reuse dec.buffer if it's large enough.
+	if cap(dec.buffer) < 2 {
+		dec.buffer = make([]byte, 2)
+	}
+	buf := dec.buffer[:2]
+	if _, err := dec.r.Read(buf[:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return 0, err
 	}
 	return uint64(buf[0])<<8 | uint64(buf[1]), nil
@@ -542,21 +568,36 @@ func (dec *Decoder) readUint16() (uint64, error) {
 
 // readUint32 reads a 32-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint32() (uint64, error) {
-	var buf [4]byte
-	if _, err := io.ReadFull(dec.r, buf[:]); err != nil {
+	// Reuse dec.buffer if it's large enough.
+	if cap(dec.buffer) < 4 {
+		dec.buffer = make([]byte, 4)
+	}
+	buf := dec.buffer[:4]
+	if _, err := dec.r.Read(buf[:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return 0, err
 	}
-	return uint64(buf[0])<<24 | uint64(buf[1])<<16 | uint64(buf[2])<<8 | uint64(buf[3]), nil
+
+	return uint64(binary.BigEndian.Uint32(buf)), nil
 }
 
 // readUint64 reads a 64-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint64() (uint64, error) {
-	var buf [8]byte
-	if _, err := io.ReadFull(dec.r, buf[:]); err != nil {
+	// Reuse dec.buffer if it's large enough.
+	if cap(dec.buffer) < 8 {
+		dec.buffer = make([]byte, 8)
+	}
+	buf := dec.buffer[:8]
+	if _, err := dec.r.Read(buf[:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return 0, err
 	}
-	return uint64(buf[0])<<56 | uint64(buf[1])<<48 | uint64(buf[2])<<40 | uint64(buf[3])<<32 |
-		uint64(buf[4])<<24 | uint64(buf[5])<<16 | uint64(buf[6])<<8 | uint64(buf[7]), nil
+
+	return binary.BigEndian.Uint64(buf), nil
 }
 
 // decodeInt decodes a CBOR negative integer into the given reflect.Value.
@@ -613,7 +654,7 @@ func (dec *Decoder) decodeBytes(rv reflect.Value, ai byte) error {
 		return errors.New("cbor: byte string too long")
 	}
 
-	if n > uint64(dec.maxBytes) {
+	if n > uint64(dec.options.MaxBytes) {
 		return errors.New("cbor: byte string too long")
 	}
 
@@ -659,11 +700,24 @@ func (dec *Decoder) decodeString(rv reflect.Value, ai byte) error {
 	if n > math.MaxInt32 {
 		return errors.New("cbor: string too long")
 	}
-	// TODO: add a configurable limit to the maximum string length
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(dec.r, buf); err != nil {
+	if n > uint64(dec.options.MaxStringBytes) {
+		return errors.New("cbor: string too long")
+	}
+
+	// Reuse dec.buffer if it's large enough.
+	if cap(dec.buffer) < int(n) {
+		dec.buffer = make([]byte, n)
+	}
+	buf := dec.buffer[:n]
+
+	_, err = dec.r.Read(buf)
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return err
 	}
+
 	switch rv.Kind() {
 	case reflect.String:
 		rv.SetString(string(buf))
@@ -709,7 +763,7 @@ func (dec *Decoder) decodeArray(rv reflect.Value, ai byte) error {
 		return err
 	}
 
-	if n > uint64(dec.maxArrayElements) {
+	if n > uint64(dec.options.MaxArrayElements) {
 		return errors.New("cbor: array too long")
 	}
 
@@ -764,6 +818,10 @@ func (dec *Decoder) decodeArray(rv reflect.Value, ai byte) error {
 	}
 	return nil
 }
+
+// fieldCache is a cache of reflect.Type fields indexed by name used
+// to speed up decoding CBOR maps into struct values.
+type fieldCache map[string]reflect.Value
 
 // decodeMap decodes a CBOR map into the given reflect.Value.
 //
@@ -970,6 +1028,45 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 		// including string, int, etc. We support all of these
 		// types.
 
+		// To reduce allocations, we use a map[int]reflect.Value
+		// to cache the field index and value. This is used to
+		// avoid the need to call rv.FieldByName for each key.
+		fieldCache := make(fieldCache, rv.NumField())
+
+		// We need both caches because we need to support both
+		// `cbor:"1,keyasint"` and `cbor:"name"` tags.
+
+		// Iterate over the map fields in the struct to build
+		// a cache of field names and keyasint values.
+		for i := 0; i < rv.NumField(); i++ {
+			field := rv.Type().Field(i)
+
+			// If the field is unexported, skip it.
+			if field.PkgPath != "" {
+				continue
+			}
+
+			// If the field has no cbor tag, add it to the
+			// field name cache with the field name as the key.
+			if field.Tag == "" {
+				fieldCache[field.Name] = rv.Field(i)
+				continue
+			}
+
+			// Check cbor tag for keyasint.
+			if tag := field.Tag.Get("cbor"); tag != "" {
+				// Use index to avoid allocating a new string.
+				if idx := strings.Index(tag, ",keyasint"); idx != -1 {
+					// If the tag is "keyasint", add it to the field cache.
+					fieldCache[tag[:idx]] = rv.Field(field.Index[0])
+				} else {
+					// If the tag is not "keyasint", add it to the field cache
+					// with the tag value as the key.
+					fieldCache[tag] = rv.Field(field.Index[0])
+				}
+			}
+		}
+
 		// For each field in the struct, find the corresponding
 		// key in the map and decode into the field.
 		for i := 0; i < int(n); i++ {
@@ -978,106 +1075,28 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				return err
 			}
 
-			var (
-				keyInt int
-				keyStr string
-			)
+			fv, ok := fieldCache[toString(key)]
+			if !ok {
+				// If the field is not found in the cache, skip it.
 
-			// Key can be a string or number. If it's a string,
-			// we can use it directly. If it's a number, we assume
-			// it is the field index.
-			var fv reflect.Value
-			switch key := key.(type) {
-			case string:
-				keyStr = key
-			case int:
-				keyInt = key
-			case int8:
-				keyInt = int(key)
-			case int16:
-				keyInt = int(key)
-			case int32:
-				keyInt = int(key)
-			case int64:
-				keyInt = int(key)
-			case uint:
-				keyInt = int(key)
-			case uint8:
-				keyInt = int(key)
-			case uint16:
-				keyInt = int(key)
-			case uint32:
-				keyInt = int(key)
-			case uint64:
-				keyInt = int(key)
-			default:
-				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
-			}
+				// Read the value and discard it.
+				if _, err := dec.readValue(); err != nil {
+					return fmt.Errorf("cbor: cannot unmarshal map key into %s: %s", rv.Type().String(), err)
+				}
 
-			var fieldName string
-
-			switch {
-			case keyStr != "":
-				fv = rv.FieldByName(keyStr)
-				fieldName = keyStr
-			case keyInt != 0:
-				// Get the field by struct field tag with matching
-				// "cbor" tag value using the `keyasint` option.
-				//
-				//  type Foo struct {
-				//      Bar string `cbor:"1,keyasint"`
-				//  }
-				//
-				fv = rv.FieldByNameFunc(func(name string) bool {
-					f, ok := rv.Type().FieldByName(name)
-					if !ok {
-						return false
-					}
-					tag := f.Tag.Get("cbor")
-					if tag == "" {
-						return false
-					}
-					opts := strings.Split(tag, ",")
-					if len(opts) == 0 {
-						return false
-					}
-
-					if len(opts) > 1 {
-						// If opts contains "keyasint", we need to
-						// check if the key matches the field index.
-						for _, opt := range opts[1:] {
-							if opt == "keyasint" && opts[0] == strconv.Itoa(keyInt) {
-								fieldName = name
-								return true
-							}
-						}
-					}
-
-					return false
-				})
-			default:
-				return errors.New("cbor: cannot unmarshal map key into " + fv.Type().String())
+				continue
 			}
 
 			// If the field value is not a pointer, we need to create
 			// a pointer to the field value and decode into that.
 			if fv.Kind() != reflect.Ptr {
-				fv = reflect.New(fv.Type())
+				fv = fv.Addr()
 			}
 
 			err = dec.decode(fv)
 			if err != nil {
 				return err
 			}
-
-			// If the field value is a pointer, but the struct field is
-			// not a pointer, we need to dereference the field value.
-			if fv.Kind() == reflect.Ptr && rv.FieldByName(fieldName).Kind() != reflect.Ptr {
-				fv = fv.Elem()
-			}
-
-			// Set value in struct.
-			rv.FieldByName(fieldName).Set(fv)
 		}
 	default:
 		return errors.New("cbor: cannot unmarshal map into " + rv.Type().String())
@@ -1555,35 +1574,46 @@ func (dec *Decoder) decodeTag(rv reflect.Value, ai byte) error {
 // decode decodes a CBOR value into rv. rv must be a pointer to a value,
 // or an interface value.
 func (dec *Decoder) decode(rv reflect.Value) error {
+	// Check if the value is not a pointer to a value.
 	if rv.Kind() != reflect.Ptr {
 		return errors.New("cbor: cannot unmarshal into non-pointer " + rv.Type().String())
 	}
+
+	// Check if the value is a nil pointer, and if so,
+	// allocate a new value.
 	if rv.IsNil() {
 		rv.Set(reflect.New(rv.Type().Elem()))
 	}
+
+	// Dereference the pointer to get the value.
 	rv = rv.Elem()
-	if rv.Kind() == reflect.Interface {
+
+	// Check the kind of the dereferenced value
+	switch rv.Kind() {
+	case reflect.Interface:
+		// Check if the interface has any methods
 		if rv.NumMethod() != 0 {
 			return errors.New("cbor: cannot unmarshal into non-empty interface " + rv.Type().String())
 		}
+		// Set the value of the interface to the decoder reader
 		rv.Set(reflect.ValueOf(&dec.r).Elem())
 		return nil
-	}
-	if rv.Kind() == reflect.Ptr {
+	case reflect.Ptr:
+		// Check if the pointer is nil
 		if rv.IsNil() {
+			// Create a new value of the same type and set it to the pointer
 			rv.Set(reflect.New(rv.Type().Elem()))
 		}
+		// Dereference the pointer
 		rv = rv.Elem()
-	}
-	if rv.Kind() == reflect.Struct {
+	case reflect.Struct:
 		return dec.decodeStruct(rv)
-	}
-	if rv.Kind() == reflect.Slice {
+	case reflect.Slice:
 		return dec.decodeSlice(rv)
+	case reflect.Map:
+		return dec.decodeMap(rv, byte(rv.Len()))
 	}
-	if rv.Kind() == reflect.Map {
-		return dec.decodeMap(rv, byte(rv.Len())) // TODO: is this correct "ai" value for map?
-	}
+
 	return dec.decodeBasic(rv)
 }
 
@@ -1606,11 +1636,11 @@ func (dec *Decoder) decodeStruct(rv reflect.Value) error {
 		}
 
 		fv := rv.FieldByNameFunc(func(name string) bool {
-			return strings.EqualFold(name, key)
+			return bytes.EqualFold([]byte(name), []byte(key))
 		})
 
 		if !fv.IsValid() {
-			return errors.New("cbor: unknown field " + key)
+			return errors.New("cbor: unknown field " + string(key))
 		}
 
 		if err := dec.decode(fv.Addr()); err != nil {
@@ -1627,17 +1657,30 @@ func (dec *Decoder) decodeSlice(rv reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	// TODO: add limit.
 
-	// Allocate a new slice.
-	sv := reflect.MakeSlice(rv.Type(), n, n)
+	if n > dec.options.MaxArrayElements {
+		return errors.New("cbor: slice (array) too large")
+	}
+
+	// Reuse the existing slice if possible.
+	if rv.IsNil() || rv.Cap() < n {
+		// Allocate a new slice.
+		sv := reflect.MakeSlice(rv.Type(), n, n)
+		rv.Set(sv)
+	} else {
+		// Reuse the existing slice if the size is the same.
+		if rv.Len() != n || rv.Cap() != n {
+			rv.SetLen(n)
+		}
+	}
+
 	// Read the slice elements.
 	for i := 0; i < n; i++ {
-		if err := dec.decode(sv.Index(i).Addr()); err != nil {
+		if err := dec.decode(rv.Index(i).Addr()); err != nil {
 			return err
 		}
 	}
-	rv.Set(sv)
+
 	return nil
 }
 
@@ -1674,7 +1717,7 @@ func (dec *Decoder) decodeBasic(rv reflect.Value) error {
 		if err != nil {
 			return err
 		}
-		rv.SetString(s)
+		rv.SetString(string(s))
 	case reflect.Interface:
 		if rv.NumMethod() != 0 {
 			return errors.New("cbor: cannot unmarshal into non-empty interface " + rv.Type().String())
@@ -1874,10 +1917,10 @@ func (dec *Decoder) readFloat64() (float64, error) {
 }
 
 // readString reads a string value from the CBOR stream.
-func (dec *Decoder) readString() (string, error) {
+func (dec *Decoder) readString() ([]byte, error) {
 	b, err := dec.readByte()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	switch {
 	case b >= 0x60 && b <= 0x77: // less than 24 bytes
@@ -1887,44 +1930,188 @@ func (dec *Decoder) readString() (string, error) {
 	case b >= 0x78 && b <= 0x7f: // more than 24 bytes (less than 256 bytes)
 		n, err := dec.readInt()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		return dec.readStringBytes(n)
-	case b == 0x7f: // indefinite length
+	case b == 0x7f: // indefinite length (TODO: verify this is correct)
 		n, err := dec.readInt()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		return dec.readStringBytes(n)
 	case b == 0xf6: // null string
-		return "", nil
+		return nil, nil
 	default:
-		return "", fmt.Errorf("cbor: invalid string value: %X", b)
+		return nil, fmt.Errorf("cbor: invalid string value: %X", b)
 	}
 }
 
 // readStringBytes reads a string value from the CBOR stream.
-func (dec *Decoder) readStringBytes(n int) (string, error) {
+func (dec *Decoder) readStringBytes(n int) ([]byte, error) {
+	// Check that the string is not empty.
 	if n == 0 {
-		return "", nil
+		return nil, nil
 	}
 
-	if n > dec.maxStringBytes {
-		return "", fmt.Errorf("cbor: string too large: %d bytes", n)
+	// Check that the string is not too large.
+	if n > dec.options.MaxStringBytes {
+		return nil, fmt.Errorf("cbor: string too large: %d bytes", n)
 	}
 
-	buf := make([]byte, n)
-	_, err := io.ReadFull(dec.r, buf)
+	// Ensure that the buffer has sufficient capacity
+	if cap(dec.buffer) < n {
+		dec.buffer = make([]byte, n)
+	}
+
+	// Use the buffer slice with the correct length
+	buf := dec.buffer[:n]
+
+	// Read the string bytes
+	_, err := dec.r.Read(buf)
 	if err != nil {
-		return "", err
+		if err == io.EOF {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, err
 	}
-	return string(buf), nil
+
+	return buf, nil
 }
 
 // readMapKey reads a map key from the CBOR stream.
 //
 // Used internally by decodeMap for decoding struct fields.
 func (dec *Decoder) readMapKey() (any, error) {
+	b, err := dec.readByte()
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case b <= 0x17:
+		return int(b), nil
+	case b >= 0x18 && b <= 0x1f:
+		return int(b & 0x1f), nil
+	case b == 0x20:
+		n, err := dec.readUint16()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b == 0x21:
+		n, err := dec.readUint32()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b == 0x22:
+		n, err := dec.readUint64()
+		if err != nil {
+			return nil, err
+		}
+		return int(n), nil
+	case b >= 0x30 && b <= 0x37: // less than 24 bytes
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b >= 0x38 && b <= 0x3f: // more than 24 bytes (less than 256 bytes)
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b == 0x7f: // indefinite length
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	case b == 0x3f: // more than 256 bytes (less than 65536 bytes)
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	case b == 0xf6: // null string
+		return "", nil
+	case b == 0xf7: // null bytes
+		return []byte{}, nil
+	case b == 0xf8: // null array
+		return []any{}, nil
+	case b == 0xf9: // null map
+		return map[any]any{}, nil
+	case b == 0xfa: // null tag
+		return nil, nil
+	case b == 0xfb: // null simple value
+		return nil, nil
+	case b == 0xff: // null
+		return nil, nil
+	case b == 0x40:
+		return false, nil
+	case b >= 0x60 && b <= 0x77: // less than 24 bytes
+		n := int(b & 0x1f)
+
+		return dec.readStringBytes(n)
+	case b >= 0x78 && b <= 0x7f: // more than 24 bytes (less than 256 bytes)
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	case b == 0x7f: // indefinite length
+		n, err := dec.readInt()
+		if err != nil {
+			return nil, err
+		}
+		return dec.readStringBytes(n)
+	default:
+		return nil, fmt.Errorf("cbor: invalid map key: %X", b)
+	}
+}
+
+// toString converts any Go value to a string as fast as possible
+// while avoiding allocations.
+func toString(v any) string {
+	switch v := v.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case int:
+		return strconv.Itoa(v)
+	case int8:
+		return strconv.Itoa(int(v))
+	case int16:
+		return strconv.Itoa(int(v))
+	case int32:
+		return strconv.Itoa(int(v))
+	case int64:
+		return strconv.Itoa(int(v))
+	case uint:
+		return strconv.Itoa(int(v))
+	case uint8:
+		return strconv.Itoa(int(v))
+	case uint16:
+		return strconv.Itoa(int(v))
+	case uint32:
+		return strconv.Itoa(int(v))
+	case uint64:
+		return strconv.Itoa(int(v))
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// readValue reads a value from the CBOR stream.
+func (dec *Decoder) readValue() (any, error) {
 	b, err := dec.readByte()
 	if err != nil {
 		return nil, err
@@ -1966,23 +2153,7 @@ func (dec *Decoder) readMapKey() (any, error) {
 			return nil, err
 		}
 		return dec.readStringBytes(n)
-	case b == 0xf6: // null string
-		return "", nil
-	case b == 0xf7: // null bytes
-		return []byte{}, nil
-	case b == 0xf8: // null array
-		return []any{}, nil
-	case b == 0xf9: // null map
-		return map[any]any{}, nil
-	case b == 0xfa: // null tag
-		return nil, nil
-	case b == 0xfb: // null simple value
-		return nil, nil
-	case b == 0xff: // null
-		return nil, nil
-	case b == 0x40:
-		return false, nil
 	default:
-		return nil, fmt.Errorf("cbor: invalid map key: %X", b)
+		return nil, fmt.Errorf("cbor: invalid value: %X", b)
 	}
 }
