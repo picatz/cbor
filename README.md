@@ -1,8 +1,8 @@
 # CBOR
  
 [Concise Binary Object Representation](https://www.rfc-editor.org/rfc/rfc8949.html) (CBOR) is a schemaless data format 
-designed to be small and extensible. This package implements a minimal Concise Binary Object Representation (CBOR)
-encoder and decoder in a similar style to the [`encoding/json`](https://pkg.go.dev/encoding/json) package.
+designed to be small and extensible. This package implements a minimal CBOR encoder and decoder in a similar style to 
+the [`encoding/json`](https://pkg.go.dev/encoding/json) package.
 
 ```go
 package main
