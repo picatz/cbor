@@ -1031,40 +1031,11 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 		// To reduce allocations, we use a map[int]reflect.Value
 		// to cache the field index and value. This is used to
 		// avoid the need to call rv.FieldByName for each key.
-		fieldCache := make(fieldCache, rv.NumField())
+		cache := loadFieldCache(rv.Type())
 
-		// We need both caches because we need to support both
-		// `cbor:"1,keyasint"` and `cbor:"name"` tags.
-
-		// Iterate over the map fields in the struct to build
-		// a cache of field names and keyasint values.
-		for i := 0; i < rv.NumField(); i++ {
-			field := rv.Type().Field(i)
-
-			// If the field is unexported, skip it.
-			if field.PkgPath != "" {
-				continue
-			}
-
-			// If the field has no cbor tag, add it to the
-			// field name cache with the field name as the key.
-			if field.Tag == "" {
-				fieldCache[field.Name] = rv.Field(i)
-				continue
-			}
-
-			// Check cbor tag for keyasint.
-			if tag := field.Tag.Get("cbor"); tag != "" {
-				// Use index to avoid allocating a new string.
-				if idx := strings.Index(tag, ",keyasint"); idx != -1 {
-					// If the tag is "keyasint", add it to the field cache.
-					fieldCache[tag[:idx]] = rv.Field(field.Index[0])
-				} else {
-					// If the tag is not "keyasint", add it to the field cache
-					// with the tag value as the key.
-					fieldCache[tag] = rv.Field(field.Index[0])
-				}
-			}
+		if cache == nil {
+			// If the cache is nil, we need to build it.
+			cache = storeFieldCache(rv)
 		}
 
 		// For each field in the struct, find the corresponding
@@ -1075,7 +1046,7 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				return err
 			}
 
-			fv, ok := fieldCache[toString(key)]
+			fv, ok := cache[toString(key)]
 			if !ok {
 				// If the field is not found in the cache, skip it.
 

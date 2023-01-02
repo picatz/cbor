@@ -933,7 +933,7 @@ func TestDecodeCWTClaims(t *testing.T) {
 // goarch: arm64
 // pkg: github.com/picatz/cbor
 // BenchmarkUnmarshalString
-// BenchmarkUnmarshalString-8   	 5436266	       185.9 ns/op	     656 B/op	       5 allocs/op
+// BenchmarkUnmarshalString-8   	 7057992	       159.6 ns/op	     656 B/op	       5 allocs/op
 func BenchmarkUnmarshalString(b *testing.B) {
 	data, err := hex.DecodeString("6B68656C6C6F20776F726C64")
 	if err != nil {
@@ -955,7 +955,7 @@ func BenchmarkUnmarshalString(b *testing.B) {
 // goarch: arm64
 // pkg: github.com/picatz/cbor
 // BenchmarkUnmarshalCWTClaims
-// BenchmarkUnmarshalCWTClaims-8   	  810913	      1276 ns/op	     856 B/op	      16 allocs/op
+// BenchmarkUnmarshalCWTClaims-8   	 1915150	       541.9 ns/op	     773 B/op	       7 allocs/op
 func BenchmarkUnmarshalCWTClaims(b *testing.B) {
 	// Data from https://tools.ietf.org/html/rfc8392#appendix-A section A.1
 	//
