@@ -4,6 +4,8 @@
 designed to be small and extensible. This package implements a minimal CBOR encoder and decoder in a similar style to 
 the [`encoding/json`](https://pkg.go.dev/encoding/json) package.
 
+> **Warning**: this is a work in progress, mostly for learning purposes. See [`github.com/fxamacker/cbor`](https://github.com/fxamacker/cbor) for a more robust implementation.
+
 ```go
 package main
 
