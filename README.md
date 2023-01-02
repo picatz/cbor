@@ -34,7 +34,8 @@ func main() {
 	//
 	// Note: this currently doesn't encode the data exactly the same 
 	//       as it got it (non-canonical).
-	err := enc.Encode(value)
+	var buf = bytes.NewBuffer(nil)
+	err = cbor.NewEncoder(buf).Encode(value)
 	if err != nil {
 		panic(err)
 	}
