@@ -819,6 +819,10 @@ func (dec *Decoder) decodeArray(rv reflect.Value, ai byte) error {
 	return nil
 }
 
+// fieldCache is a cache of reflect.Type fields indexed by name used
+// to speed up decoding CBOR maps into struct values.
+type fieldCache map[string]reflect.Value
+
 // decodeMap decodes a CBOR map into the given reflect.Value.
 //
 // ai is the additional information byte for the map, which contains the
@@ -1027,7 +1031,7 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 		// To reduce allocations, we use a map[int]reflect.Value
 		// to cache the field index and value. This is used to
 		// avoid the need to call rv.FieldByName for each key.
-		fieldCache := make(map[string]reflect.Value, rv.NumField())
+		fieldCache := make(fieldCache, rv.NumField())
 
 		// We need both caches because we need to support both
 		// `cbor:"1,keyasint"` and `cbor:"name"` tags.
