@@ -241,10 +241,25 @@ type Decoder struct {
 	// contains filtered or unexported fields
 	r io.Reader
 
-	maxArrayElements int
-	maxMapPairs      int
-	maxStringBytes   int
-	maxBytes         int
+	buf [1]byte
+
+	buffer []byte
+
+	Options *DecoderOptions
+}
+
+type DecoderOptions struct {
+	MaxArrayElements int
+	MaxMapPairs      int
+	MaxStringBytes   int
+	MaxBytes         int
+}
+
+var DefaultDecoderOptions = DecoderOptions{
+	MaxArrayElements: DefaultMaxValue,
+	MaxMapPairs:      DefaultMaxValue,
+	MaxStringBytes:   DefaultMaxValue,
+	MaxBytes:         DefaultMaxValue,
 }
 
 // DefaultMaxValue is the default maximum value for the decoder
@@ -255,25 +270,29 @@ type Decoder struct {
 // If you do not need to decode large values, you can decrease
 // the limit to reduce the memory usage of the decoder. This is
 // also useful for mitigating DoS attacks.
-const DefaultMaxValue = 1000000
+const DefaultMaxValue = 10_000
 
 // NewDecoder returns a new decoder that reads from r.
 func NewDecoder(r io.Reader) *Decoder {
+	// if the reader is a ByteReader, use it directly because it is
+	// more efficient than using bufio.Reader.
+	// if _, ok := r.(io.ByteReader); !ok {
+	// 	r = bufio.NewReader(r)
+	// }
+
 	return &Decoder{
-		r:                r,
-		maxArrayElements: DefaultMaxValue,
-		maxMapPairs:      DefaultMaxValue,
-		maxStringBytes:   DefaultMaxValue,
-		maxBytes:         DefaultMaxValue,
+		r:       r,
+		buffer:  make([]byte, 0, 512), // 512 is the default bufio size
+		Options: &DefaultDecoderOptions,
 	}
 }
 
 // SetMax sets all the maximum values to n.
 func (dec *Decoder) SetMax(n int) {
-	dec.maxArrayElements = n
-	dec.maxMapPairs = n
-	dec.maxStringBytes = n
-	dec.maxBytes = n
+	dec.Options.MaxArrayElements = n
+	dec.Options.MaxMapPairs = n
+	dec.Options.MaxStringBytes = n
+	dec.Options.MaxBytes = n
 }
 
 // SetMaxArrayElements sets the maximum number of elements in an array.
@@ -281,18 +300,18 @@ func (dec *Decoder) SetMax(n int) {
 // If the number of elements in an array exceeds this limit, an error is
 // returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxArrayElements(n int) {
-	dec.maxArrayElements = n
+	dec.Options.MaxArrayElements = n
 }
 
 // SetMaxMapPairs sets the maximum number of pairs in a map.
 //
 // If the number of pairs in a map exceeds this limit, an error is returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxMapPairs(n int) {
-	dec.maxMapPairs = n
+	dec.Options.MaxMapPairs = n
 }
 
 // SetMaxStringBytes sets the maximum number of bytes in a string.
@@ -300,9 +319,9 @@ func (dec *Decoder) SetMaxMapPairs(n int) {
 // If the number of bytes in a string exceeds this limit, an error is
 // returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxStringBytes(n int) {
-	dec.maxStringBytes = n
+	dec.Options.MaxStringBytes = n
 }
 
 // SetMaxBytes sets the maximum number of bytes in a byte string.
@@ -310,9 +329,9 @@ func (dec *Decoder) SetMaxStringBytes(n int) {
 // If the number of bytes in a byte string exceeds this limit, an error is
 // returned.
 //
-// The default limit is 1,000,000.
+// The default limit is 10,000.
 func (dec *Decoder) SetMaxBytes(n int) {
-	dec.maxBytes = n
+	dec.Options.MaxBytes = n
 }
 
 // Decode reads the next CBOR-encoded value from its input and stores
@@ -341,12 +360,11 @@ func (dec *Decoder) Decode(v interface{}) error {
 //
 // This is the basic building block for all other CBOR decoding.
 func (dec *Decoder) readByte() (byte, error) {
-	var b [1]byte
-	_, err := io.ReadFull(dec.r, b[:])
+	_, err := dec.r.Read(dec.buf[:])
 	if err != nil {
 		return 0, err
 	}
-	return b[0], nil
+	return dec.buf[0], nil
 }
 
 // readHeader reads the header byte and returns the major type and additional
@@ -533,8 +551,15 @@ func (dec *Decoder) readUint8() (uint64, error) {
 
 // readUint16 reads a 16-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint16() (uint64, error) {
-	var buf [2]byte
-	if _, err := io.ReadFull(dec.r, buf[:]); err != nil {
+	// Reuse dec.buffer if it's large enough.
+	if len(dec.buffer) < 2 {
+		dec.buffer = make([]byte, 2)
+	}
+	buf := dec.buffer[:2]
+	if _, err := dec.r.Read(buf[:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return 0, err
 	}
 	return uint64(buf[0])<<8 | uint64(buf[1]), nil
@@ -542,8 +567,15 @@ func (dec *Decoder) readUint16() (uint64, error) {
 
 // readUint32 reads a 32-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint32() (uint64, error) {
-	var buf [4]byte
-	if _, err := io.ReadFull(dec.r, buf[:]); err != nil {
+	// Reuse dec.buffer if it's large enough.
+	if len(dec.buffer) < 4 {
+		dec.buffer = make([]byte, 4)
+	}
+	buf := dec.buffer[:4]
+	if _, err := dec.r.Read(buf[:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return 0, err
 	}
 	return uint64(buf[0])<<24 | uint64(buf[1])<<16 | uint64(buf[2])<<8 | uint64(buf[3]), nil
@@ -551,8 +583,15 @@ func (dec *Decoder) readUint32() (uint64, error) {
 
 // readUint64 reads a 64-bit unsigned integer from the input stream.
 func (dec *Decoder) readUint64() (uint64, error) {
-	var buf [8]byte
-	if _, err := io.ReadFull(dec.r, buf[:]); err != nil {
+	// Reuse dec.buffer if it's large enough.
+	if len(dec.buffer) < 8 {
+		dec.buffer = make([]byte, 8)
+	}
+	buf := dec.buffer[:8]
+	if _, err := dec.r.Read(buf[:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return 0, err
 	}
 	return uint64(buf[0])<<56 | uint64(buf[1])<<48 | uint64(buf[2])<<40 | uint64(buf[3])<<32 |
@@ -613,7 +652,7 @@ func (dec *Decoder) decodeBytes(rv reflect.Value, ai byte) error {
 		return errors.New("cbor: byte string too long")
 	}
 
-	if n > uint64(dec.maxBytes) {
+	if n > uint64(dec.Options.MaxBytes) {
 		return errors.New("cbor: byte string too long")
 	}
 
@@ -709,7 +748,7 @@ func (dec *Decoder) decodeArray(rv reflect.Value, ai byte) error {
 		return err
 	}
 
-	if n > uint64(dec.maxArrayElements) {
+	if n > uint64(dec.Options.MaxArrayElements) {
 		return errors.New("cbor: array too long")
 	}
 
@@ -1017,9 +1056,7 @@ func (dec *Decoder) decodeMap(rv reflect.Value, ai byte) error {
 				return err
 			}
 
-			keyStr := toString(key)
-
-			fv, ok := fieldCache[keyStr]
+			fv, ok := fieldCache[toString(key)]
 			if !ok {
 				// If the field is not found in the cache, skip it.
 
@@ -1518,35 +1555,46 @@ func (dec *Decoder) decodeTag(rv reflect.Value, ai byte) error {
 // decode decodes a CBOR value into rv. rv must be a pointer to a value,
 // or an interface value.
 func (dec *Decoder) decode(rv reflect.Value) error {
+	// Check if the value is not a pointer to a value.
 	if rv.Kind() != reflect.Ptr {
 		return errors.New("cbor: cannot unmarshal into non-pointer " + rv.Type().String())
 	}
+
+	// Check if the value is a nil pointer, and if so,
+	// allocate a new value.
 	if rv.IsNil() {
 		rv.Set(reflect.New(rv.Type().Elem()))
 	}
+
+	// Dereference the pointer to get the value.
 	rv = rv.Elem()
-	if rv.Kind() == reflect.Interface {
+
+	// Check the kind of the dereferenced value
+	switch rv.Kind() {
+	case reflect.Interface:
+		// Check if the interface has any methods
 		if rv.NumMethod() != 0 {
 			return errors.New("cbor: cannot unmarshal into non-empty interface " + rv.Type().String())
 		}
+		// Set the value of the interface to the decoder reader
 		rv.Set(reflect.ValueOf(&dec.r).Elem())
 		return nil
-	}
-	if rv.Kind() == reflect.Ptr {
+	case reflect.Ptr:
+		// Check if the pointer is nil
 		if rv.IsNil() {
+			// Create a new value of the same type and set it to the pointer
 			rv.Set(reflect.New(rv.Type().Elem()))
 		}
+		// Dereference the pointer
 		rv = rv.Elem()
-	}
-	if rv.Kind() == reflect.Struct {
+	case reflect.Struct:
 		return dec.decodeStruct(rv)
-	}
-	if rv.Kind() == reflect.Slice {
+	case reflect.Slice:
 		return dec.decodeSlice(rv)
+	case reflect.Map:
+		return dec.decodeMap(rv, byte(rv.Len()))
 	}
-	if rv.Kind() == reflect.Map {
-		return dec.decodeMap(rv, byte(rv.Len())) // TODO: is this correct "ai" value for map?
-	}
+
 	return dec.decodeBasic(rv)
 }
 
@@ -1590,17 +1638,30 @@ func (dec *Decoder) decodeSlice(rv reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	// TODO: add limit.
 
-	// Allocate a new slice.
-	sv := reflect.MakeSlice(rv.Type(), n, n)
+	if n > dec.Options.MaxArrayElements {
+		return errors.New("cbor: slice (array) too large")
+	}
+
+	// Reuse the existing slice if possible.
+	if rv.IsNil() || rv.Cap() < n {
+		// Allocate a new slice.
+		sv := reflect.MakeSlice(rv.Type(), n, n)
+		rv.Set(sv)
+	} else {
+		// Reuse the existing slice if the size is the same.
+		if rv.Len() != n || rv.Cap() != n {
+			rv.SetLen(n)
+		}
+	}
+
 	// Read the slice elements.
 	for i := 0; i < n; i++ {
-		if err := dec.decode(sv.Index(i).Addr()); err != nil {
+		if err := dec.decode(rv.Index(i).Addr()); err != nil {
 			return err
 		}
 	}
-	rv.Set(sv)
+
 	return nil
 }
 
@@ -1853,7 +1914,7 @@ func (dec *Decoder) readString() (string, error) {
 			return "", err
 		}
 		return dec.readStringBytes(n)
-	case b == 0x7f: // indefinite length
+	case b == 0x7f: // indefinite length (TODO: verify this is correct)
 		n, err := dec.readInt()
 		if err != nil {
 			return "", err
@@ -1868,19 +1929,33 @@ func (dec *Decoder) readString() (string, error) {
 
 // readStringBytes reads a string value from the CBOR stream.
 func (dec *Decoder) readStringBytes(n int) (string, error) {
+	// Check that the string is not empty.
 	if n == 0 {
 		return "", nil
 	}
 
-	if n > dec.maxStringBytes {
+	// Check that the string is not too large.
+	if n > dec.Options.MaxStringBytes {
 		return "", fmt.Errorf("cbor: string too large: %d bytes", n)
 	}
 
-	buf := make([]byte, n)
-	_, err := io.ReadFull(dec.r, buf)
+	// Ensure that the buffer has sufficient capacity
+	if cap(dec.buffer) < n {
+		dec.buffer = make([]byte, n)
+	}
+
+	// Use the buffer slice with the correct length
+	buf := dec.buffer[:n]
+
+	// Read the string bytes
+	_, err := dec.r.Read(buf)
 	if err != nil {
+		if err == io.EOF {
+			return "", io.ErrUnexpectedEOF
+		}
 		return "", err
 	}
+
 	return string(buf), nil
 }
 

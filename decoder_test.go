@@ -808,9 +808,7 @@ var benchDecodeMalformedValue []uint8
 // goarch: arm64
 // pkg: github.com/picatz/cbor
 // BenchmarkDecodeMalformed
-// BenchmarkDecodeMalformed-8   	12116209	        94.26 ns/op	     128 B/op	       5 allocs/op
-// PASS
-// ok  	github.com/picatz/cbor	1.417s
+// BenchmarkDecodeMalformed-8   	 4152103	       289.8 ns/op	     712 B/op	       7 allocs/op
 func BenchmarkDecodeMalformed(b *testing.B) {
 	// This is a malformed CBOR data stream.
 	data := []byte{0x9B, 0x00, 0x00, 0x42, 0xFA, 0x42, 0xFA, 0x42, 0xFA, 0x42} // designed to cause an error (large array)
@@ -879,35 +877,7 @@ func TestDecodeCWTClaims(t *testing.T) {
 // goarch: arm64
 // pkg: github.com/picatz/cbor
 // BenchmarkUnmarshalCWTClaims
-// BenchmarkUnmarshalCWTClaims-8   	  116292	     10138 ns/op	    2712 B/op	     165 allocs/op
-// PASS
-// ok  	github.com/picatz/cbor	1.367s
-//
-// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
-//
-// goos: darwin
-// goarch: arm64
-// pkg: github.com/picatz/cbor
-// BenchmarkUnmarshalCWTClaims
-// BenchmarkUnmarshalCWTClaims-8   	  697783	      1649 ns/op	     648 B/op	      46 allocs/op
-// PASS
-// ok  	github.com/picatz/cbor	1.314s
-//
-// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
-//
-// goos: darwin
-// goarch: arm64
-// pkg: github.com/picatz/cbor
-// BenchmarkUnmarshalCWTClaims
-// BenchmarkUnmarshalCWTClaims-8   	  692305	      1628 ns/op	     424 B/op	      39 allocs/op
-//
-// $ go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalCWTClaims$ github.com/picatz/cbor -v
-//
-// goos: darwin
-// goarch: arm64
-// pkg: github.com/picatz/cbor
-// BenchmarkUnmarshalCWTClaims
-// BenchmarkUnmarshalCWTClaims-8   	  862381	      1383 ns/op	     424 B/op	      39 allocs/op
+// BenchmarkUnmarshalCWTClaims-8   	  937486	      1272 ns/op	     864 B/op	      17 allocs/op
 func BenchmarkUnmarshalCWTClaims(b *testing.B) {
 	b.StopTimer()
 	// Data from https://tools.ietf.org/html/rfc8392#appendix-A section A.1
@@ -920,32 +890,6 @@ func BenchmarkUnmarshalCWTClaims(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var v claims
 		if err := cbor.Unmarshal(data, &v); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// $ go test -benchmem -run=^$ -bench ^BenchmarkDecodeCWTClaims$ github.com/picatz/cbor -v
-//
-// goos: darwin
-// goarch: arm64
-// pkg: github.com/picatz/cbor
-// BenchmarkDecodeCWTClaims
-// BenchmarkDecodeCWTClaims-8   	  116398	     10221 ns/op	    2712 B/op	     165 allocs/op
-// PASS
-// ok  	github.com/picatz/cbor	1.385s
-func BenchmarkDecodeCWTClaims(b *testing.B) {
-	b.StopTimer()
-	// Data from https://tools.ietf.org/html/rfc8392#appendix-A section A.1
-	data, err := hex.DecodeString("a70175636f61703a2f2f61732e6578616d706c652e636f6d02656572696b77037818636f61703a2f2f6c696768742e6578616d706c652e636f6d041a5612aeb0051a5610d9f0061a5610d9f007420b71")
-	if err != nil {
-		b.Fatal("hex.DecodeString:", err)
-	}
-
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
-		var v claims
-		if err := cbor.NewDecoder(bytes.NewReader(data)).Decode(&v); err != nil {
 			b.Fatal(err)
 		}
 	}
