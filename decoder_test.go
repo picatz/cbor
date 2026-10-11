@@ -464,22 +464,8 @@ func TestDecodeArray(t *testing.T) {
 					t.Fatal("expected bar, got", value[0].Foo)
 				}
 
-				// Note: it's super weird to handle this case.
-				//
-				// If the CBOR map value is null, how should
-				// the struct field be handled? Should it be
-				// set to nil, or should it be set to the
-				// zero value of the field type? How do you distinguish
-				// between a null value, zero value, or a non-existent
-				// value in the data?
-				//
-				// TODO: figure out how to handle this case canonically,
-				//       and document it.
-				if value[0].Baz == nil {
-					t.Fatal("expected non-nil, got nil")
-				}
-				if *value[0].Baz != "" {
-					t.Fatal("expected empty string, got", *value[0].Baz)
+				if value[0].Baz != nil {
+					t.Fatal("expected nil for null, got", value[0].Baz)
 				}
 			})
 
@@ -496,17 +482,14 @@ func TestDecodeArray(t *testing.T) {
 				if value[0].Foo != "bar" {
 					t.Fatal("expected bar, got", value[0].Foo)
 				}
-				if value[0].Baz == nil {
-					t.Fatal("expected non-nil, got nil")
-				}
-				if *value[0].Baz != "" {
-					t.Fatal("expected empty string, got", *value[0].Baz)
+				if value[0].Baz != nil {
+					t.Fatal("expected nil for null, got", value[0].Baz)
 				}
 			})
 		})
 
 		t.Run("short", func(t *testing.T) {
-			data := "\x81\xA2\x63\x66\x6F\x6F\x63\x62\x61\x72" // [{"foo":"bar"}]
+			data := "\x81\xA1\x63\x66\x6F\x6F\x63\x62\x61\x72" // [{"foo":"bar"}]
 
 			t.Run("pointer", func(t *testing.T) {
 				var value []*struct {

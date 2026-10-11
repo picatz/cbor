@@ -1,225 +1,259 @@
 package cbor
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"reflect"
+	"sort"
+	"unicode/utf8"
 )
 
-// Encoder is a minimal CBOR encoder.
-type Encoder struct {
-	// contains filtered or unexported fields
-	w io.Writer
-}
+// Encoder writes definite-length CBOR with shortest integer and length headers.
+// Map keys are sorted by encoded length and then byte order. Floats use binary64;
+// this is not a claim of full canonical or CTAP canonical encoding.
+type Encoder struct{ writer io.Writer }
 
-// NewEncoder returns a new encoder that writes to w.
-func NewEncoder(w io.Writer) *Encoder {
-	return &Encoder{w: w}
-}
+// NewEncoder constructs an encoder. Each item is bounded to 1 MiB and 64 levels.
+func NewEncoder(writer io.Writer) *Encoder { return &Encoder{writer: writer} }
 
-// Encode writes the CBOR encoding of v to the stream.
-func (e *Encoder) Encode(v interface{}) error {
-	rv := reflect.ValueOf(v)
+// Marshal encodes a value into a caller-owned byte slice.
+func Marshal(value any) ([]byte, error) { return encode(nil, reflect.ValueOf(value), 0) }
 
-	// Handle nil.
-	if !rv.IsValid() {
-		return e.writeNull()
+// Encode validates and buffers one complete item before writing it. A writer
+// failure can still leave partial output and is returned to the caller.
+func (encoder *Encoder) Encode(value any) error {
+	if encoder.writer == nil {
+		return errors.New("cbor: nil writer")
 	}
+	encoded, err := Marshal(value)
+	if err != nil {
+		return err
+	}
+	written, err := encoder.writer.Write(encoded)
+	if err == nil && written != len(encoded) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
 
-	// Handle types.
-	switch rv.Kind() {
+func appendHeader(output []byte, major byte, argument uint64) []byte {
+	marker := major << 5
+	switch {
+	case argument < 24:
+		return append(output, marker|byte(argument))
+	case argument <= math.MaxUint8:
+		return append(output, marker|24, byte(argument))
+	case argument <= math.MaxUint16:
+		return append(output, marker|25, byte(argument>>8), byte(argument))
+	case argument <= math.MaxUint32:
+		return append(output, marker|26, byte(argument>>24), byte(argument>>16), byte(argument>>8), byte(argument))
+	default:
+		output = append(output, marker|27)
+		var buffer [8]byte
+		binary.BigEndian.PutUint64(buffer[:], argument)
+		return append(output, buffer[:]...)
+	}
+}
+
+func encode(output []byte, value reflect.Value, depth int) ([]byte, error) {
+	if depth > 64 {
+		return nil, errors.New("cbor: encoding nesting limit exceeded")
+	}
+	if len(output) >= 1<<20 {
+		return nil, errors.New("cbor: encoding size limit exceeded")
+	}
+	if !value.IsValid() {
+		return append(output, 0xf6), nil
+	}
+	if (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) && value.IsNil() {
+		return append(output, 0xf6), nil
+	}
+	if value.CanInterface() {
+		if marshaler, ok := value.Interface().(Marshaler); ok {
+			encoded, err := marshaler.MarshalCBOR()
+			if err != nil {
+				return nil, err
+			}
+			if len(encoded) > 1<<20-len(output) {
+				return nil, errors.New("cbor: encoding size limit exceeded")
+			}
+			if err := validateRawAtDepth(encoded, depth); err != nil {
+				return nil, err
+			}
+			return append(output, encoded...), nil
+		}
+		if tagged, ok := value.Interface().(TaggedValue); ok {
+			return encode(appendHeader(output, 6, tagged.Number), reflect.ValueOf(tagged.Value), depth+1)
+		}
+		if simple, ok := value.Interface().(SimpleValue); ok {
+			switch simple {
+			case SimpleValueFalse, SimpleValueTrue, SimpleValueNull, SimpleValueUndefined:
+				return append(output, 0xe0|byte(simple)), nil
+			}
+			return nil, errors.New("cbor: unsupported simple value")
+		}
+	}
+	switch value.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		return encode(output, value.Elem(), depth+1)
 	case reflect.Bool:
-		return e.writeBool(rv.Bool())
+		if value.Bool() {
+			return append(output, 0xf5), nil
+		}
+		return append(output, 0xf4), nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return e.writeInt(rv.Int())
+		number := value.Int()
+		if number < 0 {
+			output = appendHeader(output, 1, uint64(-(number + 1)))
+		} else {
+			output = appendHeader(output, 0, uint64(number))
+		}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return e.writeUint(rv.Uint())
+		output = appendHeader(output, 0, value.Uint())
 	case reflect.Float32, reflect.Float64:
-		return e.writeFloat(rv.Float())
+		var buffer [8]byte
+		binary.BigEndian.PutUint64(buffer[:], math.Float64bits(value.Float()))
+		output = append(output, 0xfb)
+		output = append(output, buffer[:]...)
 	case reflect.String:
-		return e.writeString(rv.String())
-	case reflect.Array, reflect.Slice:
-		return e.writeArray(rv)
-	case reflect.Map:
-		return e.writeMap(rv)
-	case reflect.Struct:
-		return e.writeStruct(rv)
+		text := value.String()
+		if !utf8.ValidString(text) {
+			return nil, errors.New("cbor: invalid UTF-8")
+		}
+		if len(text) > 1<<20-len(output)-9 {
+			return nil, errors.New("cbor: encoding size limit exceeded")
+		}
+		output = appendHeader(output, 3, uint64(len(text)))
+		output = append(output, text...)
+	case reflect.Slice, reflect.Array:
+		if value.Kind() == reflect.Slice && value.IsNil() {
+			return append(output, 0xf6), nil
+		}
+		if value.Kind() == reflect.Slice && value.Type().Elem().Kind() == reflect.Uint8 {
+			if value.Len() > 1<<20-len(output)-9 {
+				return nil, errors.New("cbor: encoding size limit exceeded")
+			}
+			output = appendHeader(output, 2, uint64(value.Len()))
+			output = append(output, value.Bytes()...)
+			break
+		}
+		if value.Len() > DefaultMaxValue {
+			return nil, errors.New("cbor: array size limit exceeded")
+		}
+		output = appendHeader(output, 4, uint64(value.Len()))
+		for index := 0; index < value.Len(); index++ {
+			var err error
+			output, err = encode(output, value.Index(index), depth+1)
+			if err != nil {
+				return nil, err
+			}
+		}
+	case reflect.Map, reflect.Struct:
+		if value.Kind() == reflect.Map && value.IsNil() {
+			return append(output, 0xf6), nil
+		}
+		return encodeMap(output, value, depth)
+	default:
+		return nil, fmt.Errorf("cbor: unsupported type %s", value.Type())
 	}
-
-	return fmt.Errorf("cbor: unsupported type: %T", v)
+	if len(output) > 1<<20 {
+		return nil, errors.New("cbor: encoding size limit exceeded")
+	}
+	return output, nil
 }
 
-// writeNull writes a null value.
-func (e *Encoder) writeNull() error {
-	_, err := e.w.Write([]byte{0xf6})
-	return err
+type encodedPair struct {
+	key   []byte
+	value reflect.Value
 }
 
-// writeBool writes a boolean value.
-func (e *Encoder) writeBool(v bool) error {
-	if v {
-		_, err := e.w.Write([]byte{0xf5})
-		return err
-	}
-	_, err := e.w.Write([]byte{0xf4})
-	return err
-}
-
-// writeInt writes an integer value.
-func (e *Encoder) writeInt(v int64) error {
-	switch {
-	case v >= 0 && v <= 23:
-		_, err := e.w.Write([]byte{byte(v)})
-		return err
-	case v >= 24 && v <= 255:
-		_, err := e.w.Write([]byte{0x18, byte(v)})
-		return err
-	case v >= 256 && v <= 65535:
-		_, err := e.w.Write([]byte{0x19, byte(v >> 8), byte(v)})
-		return err
-	case v >= 65536 && v <= 4294967295:
-		_, err := e.w.Write([]byte{0x1a, byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
-		return err
-	case v >= 4294967296 && v <= math.MaxInt64-1:
-		_, err := e.w.Write([]byte{0x1b, byte(v >> 56), byte(v >> 48), byte(v >> 40), byte(v >> 32), byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
-		return err
-	}
-	return fmt.Errorf("cbor: integer out of range: %d", v)
-}
-
-// writeUint writes an unsigned integer value.
-func (e *Encoder) writeUint(v uint64) error {
-	switch {
-	case v <= 23:
-		_, err := e.w.Write([]byte{byte(v)})
-		return err
-	case v >= 24 && v <= 255:
-		_, err := e.w.Write([]byte{0x18, byte(v)})
-		return err
-	case v >= 256 && v <= 65535:
-		_, err := e.w.Write([]byte{0x19, byte(v >> 8), byte(v)})
-		return err
-	case v >= 65536 && v <= 4294967295:
-		_, err := e.w.Write([]byte{0x1a, byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
-		return err
-	case v >= 4294967296 && v <= math.MaxUint64-1:
-		_, err := e.w.Write([]byte{0x1b, byte(v >> 56), byte(v >> 48), byte(v >> 40), byte(v >> 32), byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
-		return err
-	}
-	return fmt.Errorf("cbor: integer out of range: %d", v)
-}
-
-// writeFloat writes a floating point value.
-func (e *Encoder) writeFloat(v float64) error {
-	// Encode as a 64-bit float.
-	_, err := e.w.Write([]byte{0xfb})
-	if err != nil {
-		return err
-	}
-
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], math.Float64bits(v))
-	_, err = e.w.Write(buf[:])
-	return err
-}
-
-// writeString writes a string value.
-func (e *Encoder) writeString(v string) error {
-	// Encode as a test string
-	_, err := e.w.Write([]byte{
-		0x78, // text string
-		byte(len(v)),
-	})
-
-	if err != nil {
-		return err
-	}
-
-	_, err = e.w.Write([]byte(v))
-	return err
-}
-
-// writeArray writes an array value.
-func (e *Encoder) writeArray(v reflect.Value) error {
-	// Encode as an array.
-	_, err := e.w.Write([]byte{
-		0x98,
-		byte(v.Len()),
-	})
-
-	if err != nil {
-		return err
-	}
-
-	for i := 0; i < v.Len(); i++ {
-		if err := e.Encode(v.Index(i).Interface()); err != nil {
+func encodeMap(output []byte, value reflect.Value, depth int) ([]byte, error) {
+	var pairs []encodedPair
+	keyBytes := 0
+	seen := make(map[any]bool)
+	add := func(key, entry reflect.Value) error {
+		encoded, err := encode(nil, key, depth+1)
+		if err != nil {
 			return err
 		}
+		options, err := DefaultDecoderOptions.normalized()
+		if err != nil {
+			return err
+		}
+		parser := parser{reader: bytes.NewReader(encoded), options: options}
+		parsed, err := parser.item(0)
+		if err != nil {
+			return err
+		}
+		identity, err := comparableKey(parsed)
+		if err != nil {
+			return err
+		}
+		if seen[identity] {
+			return errors.New("cbor: duplicate encoded map key")
+		}
+		seen[identity] = true
+		keyBytes += len(encoded)
+		if keyBytes > 1<<20 || len(pairs) >= DefaultMaxValue {
+			return errors.New("cbor: map size limit exceeded")
+		}
+		pairs = append(pairs, encodedPair{key: encoded, value: entry})
+		return nil
 	}
-
-	return nil
+	if value.Kind() == reflect.Map {
+		if value.Len() > DefaultMaxValue {
+			return nil, errors.New("cbor: map size limit exceeded")
+		}
+		iterator := value.MapRange()
+		for iterator.Next() {
+			if err := add(iterator.Key(), iterator.Value()); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		fields, err := fieldsFor(value.Type())
+		if err != nil {
+			return nil, err
+		}
+		for _, field := range fields {
+			entry := value.Field(field.index)
+			if field.omitEmpty && emptyValue(entry) {
+				continue
+			}
+			if err := add(reflect.ValueOf(field.key), entry); err != nil {
+				return nil, err
+			}
+		}
+	}
+	sort.Slice(pairs, func(left, right int) bool {
+		if len(pairs[left].key) != len(pairs[right].key) {
+			return len(pairs[left].key) < len(pairs[right].key)
+		}
+		return bytes.Compare(pairs[left].key, pairs[right].key) < 0
+	})
+	output = appendHeader(output, 5, uint64(len(pairs)))
+	for _, pair := range pairs {
+		if len(pair.key) > 1<<20-len(output) {
+			return nil, errors.New("cbor: encoding size limit exceeded")
+		}
+		output = append(output, pair.key...)
+		var err error
+		output, err = encode(output, pair.value, depth+1)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return output, nil
 }
 
-// writeMap writes a map value.
-func (e *Encoder) writeMap(v reflect.Value) error {
-	// Encode as a map.
-	_, err := e.w.Write([]byte{
-		0xb8,
-		byte(v.Len()),
-	})
-
-	if err != nil {
-		return err
+func emptyValue(value reflect.Value) bool {
+	switch value.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return value.Len() == 0
 	}
-
-	// getKey returns the human friendly key type
-	// to encode the map key.
-	getKey := func(key reflect.Value) interface{} {
-		switch key.Kind() {
-		case reflect.String:
-			return key.String()
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			return key.Int()
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			return key.Uint()
-		default:
-			return key.Interface()
-		}
-	}
-
-	for _, key := range v.MapKeys() {
-		// Encode key, then value.
-		if err := e.Encode(getKey(key)); err != nil {
-			return err
-		}
-
-		if err := e.Encode(v.MapIndex(key).Interface()); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// writeStruct writes a struct value.
-func (e *Encoder) writeStruct(v reflect.Value) error {
-	// Encode as a map.
-	_, err := e.w.Write([]byte{
-		0xb8,
-		byte(v.NumField()),
-	})
-
-	if err != nil {
-		return err
-	}
-
-	for i := 0; i < v.NumField(); i++ {
-		if err := e.Encode(v.Field(i).Interface()); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return value.IsZero()
 }

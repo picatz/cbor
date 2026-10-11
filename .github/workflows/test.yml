@@ -1,0 +1,20 @@
+name: Test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.19.x', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go test -run '^$' -fuzz FuzzDecode -fuzztime 15s -parallel 2
