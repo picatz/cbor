@@ -32,9 +32,10 @@ const (
 	MajorTypeSimple MajorType = 7 // simple (bool, nil, etc.)
 )
 
-// SimpleValue is a simple value.
+// SimpleValue is a CBOR simple value. Undefined and unassigned simple values
+// decode as SimpleValue; values 24 through 31 cannot be encoded.
 //
-// https://tools.ietf.org/html/rfc7049#section-2.3
+// https://www.rfc-editor.org/rfc/rfc8949.html#section-3.3
 type SimpleValue int
 
 // Simple values defined in RFC 7049.

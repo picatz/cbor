@@ -1,8 +1,8 @@
 package cbor
 
 import (
-	"bytes"
 	"errors"
+	"io"
 )
 
 // RawMessage retains one encoded CBOR item, including its original header.
@@ -13,7 +13,7 @@ func (message RawMessage) MarshalCBOR() ([]byte, error) {
 	if message == nil {
 		return []byte{0xf6}, nil
 	}
-	if err := validateRaw(message); err != nil {
+	if err := validateRawAtDepth(message, 0, false); err != nil {
 		return nil, err
 	}
 	return message, nil
@@ -28,25 +28,33 @@ func (message *RawMessage) UnmarshalCBOR(data []byte) error {
 	return nil
 }
 
-func validateRaw(data []byte) error {
-	return validateRawAtDepth(data, 0)
+// rawOptions validates embedded raw items and encoded map keys. It is fixed so
+// that encoding never depends on the mutable DefaultDecoderOptions.
+var rawOptions = DecoderOptions{
+	MaxArrayElements: DefaultMaxValue, MaxMapPairs: DefaultMaxValue,
+	MaxStringBytes: maxEncodedItem, MaxBytes: maxEncodedItem,
+	MaxNestedLevels: maxEncodedDepth, MaxEncodedBytes: maxEncodedItem,
 }
 
-func validateRawAtDepth(data []byte, depth int) error {
-	options, err := DefaultDecoderOptions.normalized()
+// validateRawAtDepth checks that data is exactly one item that fits in the
+// remaining nesting budget and, when deterministic is set, that it is in core
+// deterministic encoding.
+func validateRawAtDepth(data []byte, depth int, deterministic bool) error {
+	options := rawOptions
+	options.RequireDeterministic = deterministic
+	options, err := options.normalized()
 	if err != nil {
 		return err
 	}
-	if options.MaxNestedLevels > 64 {
-		options.MaxNestedLevels = 64
-	}
-	reader := bytes.NewReader(data)
-	parser := parser{reader: reader, options: options}
+	parser := parser{input: data, options: options}
 	if _, err := parser.item(depth); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return err
 	}
-	if reader.Len() != 0 {
-		return errors.New("cbor: trailing raw data")
+	if len(parser.data) != len(data) {
+		return newError(ErrMalformed, len(parser.data), "trailing raw data")
 	}
 	return nil
 }

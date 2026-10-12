@@ -3,17 +3,15 @@ package cbor
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"reflect"
-	"strconv"
-	"strings"
 	"unicode/utf8"
 )
 
-// Unmarshaler decodes one validated CBOR item. Implementations must copy data
-// they retain after returning.
+// Unmarshaler decodes one validated CBOR item. The data may alias the input or
+// the decoder's buffer, so implementations must copy data they retain after
+// returning.
 type Unmarshaler interface{ UnmarshalCBOR([]byte) error }
 
 // Marshaler returns the encoding of exactly one CBOR item.
@@ -38,7 +36,19 @@ type DecoderOptions struct {
 	MaxNestedLevels  int
 	MaxEncodedBytes  int
 	RejectTags       bool
+
+	// RejectNonMinimal rejects integer, length and tag arguments that are not
+	// encoded in their shortest form.
 	RejectNonMinimal bool
+
+	// RequireDeterministic accepts only items in RFC 8949 core deterministic
+	// encoding: shortest arguments, shortest floating-point values that
+	// preserve the value (with every NaN as 0xf97e00), and map keys in
+	// bytewise lexicographic order of their encodings. Such input is exactly
+	// what Marshal produces with CoreDeterministicEncoding.
+	//
+	// https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1
+	RequireDeterministic bool
 }
 
 // DefaultDecoderOptions is copied when a decoder is constructed. Configure it
@@ -88,7 +98,7 @@ func (decoder *Decoder) SetMaxStringBytes(limit int) { decoder.options.MaxString
 func (decoder *Decoder) SetMaxBytes(limit int) { decoder.options.MaxBytes = limit }
 
 func (options DecoderOptions) normalized() (DecoderOptions, error) {
-	for _, limit := range []*int{&options.MaxArrayElements, &options.MaxMapPairs, &options.MaxStringBytes, &options.MaxBytes} {
+	for _, limit := range [...]*int{&options.MaxArrayElements, &options.MaxMapPairs, &options.MaxStringBytes, &options.MaxBytes} {
 		if *limit < 0 {
 			return options, errors.New("cbor: negative decoder limit")
 		}
@@ -105,6 +115,9 @@ func (options DecoderOptions) normalized() (DecoderOptions, error) {
 	if options.MaxEncodedBytes == 0 {
 		options.MaxEncodedBytes = 1 << 20
 	}
+	if options.RequireDeterministic {
+		options.RejectNonMinimal = true
+	}
 	return options, nil
 }
 
@@ -117,24 +130,31 @@ func Unmarshal(data []byte, destination any) error {
 
 // Unmarshal decodes exactly one item using these limits.
 func (options DecoderOptions) Unmarshal(data []byte, destination any) error {
-	reader := bytes.NewReader(data)
-	decoder := NewDecoderWithOptions(reader, options)
-	return decoder.decode(destination, func() error {
-		if reader.Len() != 0 {
-			return errors.New("cbor: trailing data")
-		}
-		return nil
-	})
+	target, err := destinationValue(destination)
+	if err != nil {
+		return err
+	}
+	options, err = options.normalized()
+	if err != nil {
+		return err
+	}
+	parser := parser{input: data, options: options}
+	root, err := parser.item(0)
+	if err != nil {
+		return err
+	}
+	if len(parser.data) != len(data) {
+		return newError(ErrMalformed, len(parser.data), "trailing data")
+	}
+	return store(target, parser.data, root)
 }
 
 // Decode reads one item. Clean stream exhaustion returns io.EOF; truncated
 // items return io.ErrUnexpectedEOF. No subsequent item is consumed.
-func (decoder *Decoder) Decode(destination any) error { return decoder.decode(destination, nil) }
-
-func (decoder *Decoder) decode(destination any, complete func() error) error {
-	value := reflect.ValueOf(destination)
-	if !value.IsValid() || value.Kind() != reflect.Ptr || value.IsNil() {
-		return errors.New("cbor: destination must be a non-nil pointer")
+func (decoder *Decoder) Decode(destination any) error {
+	target, err := destinationValue(destination)
+	if err != nil {
+		return err
 	}
 	if decoder.reader == nil {
 		return errors.New("cbor: nil reader")
@@ -144,42 +164,85 @@ func (decoder *Decoder) decode(destination any, complete func() error) error {
 		return err
 	}
 	parser := parser{reader: decoder.reader, options: options}
-	item, err := parser.item(0)
+	root, err := parser.item(0)
 	if err != nil {
 		return err
 	}
-	if complete != nil {
-		if err := complete(); err != nil {
-			return err
-		}
+	return store(target, parser.data, root)
+}
+
+func destinationValue(destination any) (reflect.Value, error) {
+	value := reflect.ValueOf(destination)
+	if !value.IsValid() || value.Kind() != reflect.Ptr || value.IsNil() {
+		return value, errors.New("cbor: destination must be a non-nil pointer")
 	}
-	replacement := reflect.New(value.Elem().Type()).Elem()
-	if err := assign(replacement, item); err != nil {
+	return value, nil
+}
+
+// store decodes into a fresh value and replaces the destination only on
+// success, so failed decodes leave it unchanged.
+func store(target reflect.Value, data []byte, root item) error {
+	replacement := reflect.New(target.Elem().Type()).Elem()
+	state := decodeState{data: data}
+	if err := state.assign(replacement, root); err != nil {
 		return err
 	}
-	value.Elem().Set(replacement)
+	target.Elem().Set(replacement)
 	return nil
 }
 
+// item is a parsed, validated CBOR data item. Scalars are kept in their
+// encoded form so parsing does not allocate per value; payload and the item's
+// raw encoding are offsets into the parser's buffer.
 type item struct {
 	major    byte
-	argument uint64
-	value    any
-	children []item
-	raw      []byte
+	minor    byte   // additional information
+	argument uint64 // integer value, length, tag number, simple value or float bits
+	start    int    // offset of the item's initial byte
+	payload  int    // offset of a string's content
+	end      int    // offset just past the item
+	children []item // array elements, alternating map keys and values, or a tag's content
 }
 
+func (value item) isFloat() bool { return value.major == 7 && value.minor >= 25 && value.minor <= 27 }
+
+func (value item) float() float64 {
+	switch value.minor {
+	case 25:
+		return halfFloat(uint16(value.argument))
+	case 26:
+		return float64(math.Float32frombits(uint32(value.argument)))
+	}
+	return math.Float64frombits(value.argument)
+}
+
+func (value item) isNull() bool { return value.major == 7 && value.minor == 22 }
+
+// parser reads one item from input or, when reader is set, from a stream
+// without read-ahead. data holds every byte of the current item consumed so
+// far; in slice mode it is a prefix of input and is never copied.
 type parser struct {
 	reader  io.Reader
+	input   []byte
 	options DecoderOptions
 	data    []byte
 }
 
 func (parser *parser) read(count int) ([]byte, error) {
-	if count < 0 || count > parser.options.MaxEncodedBytes-len(parser.data) {
-		return nil, errors.New("cbor: encoded size limit exceeded")
-	}
 	start := len(parser.data)
+	if count < 0 || count > parser.options.MaxEncodedBytes-start {
+		return nil, newError(ErrLimit, start, "encoded size limit exceeded")
+	}
+	if parser.reader == nil {
+		if count > len(parser.input)-start {
+			if start == 0 && len(parser.input) == 0 {
+				return nil, io.EOF
+			}
+			return nil, io.ErrUnexpectedEOF
+		}
+		parser.data = parser.input[:start+count]
+		return parser.data[start:], nil
+	}
 	parser.data = append(parser.data, make([]byte, count)...)
 	read, err := io.ReadFull(parser.reader, parser.data[start:])
 	if err != nil {
@@ -192,24 +255,38 @@ func (parser *parser) read(count int) ([]byte, error) {
 	return parser.data[start:], nil
 }
 
-func (parser *parser) item(depth int) (result item, err error) {
-	if depth > parser.options.MaxNestedLevels {
-		return result, errors.New("cbor: nesting limit exceeded")
+// smallCapacity bounds preallocation from an untrusted count; larger
+// containers grow as their elements are actually read.
+func smallCapacity(count uint64) int {
+	if count > 16 {
+		return 16
 	}
+	return int(count)
+}
+
+func (parser *parser) item(depth int) (result item, err error) {
 	start := len(parser.data)
+	if depth > parser.options.MaxNestedLevels {
+		return result, newError(ErrLimit, start, "nesting limit exceeded")
+	}
 	header, err := parser.read(1)
 	if err != nil {
 		return result, err
 	}
-	initial := header[0]
-	result.major = initial >> 5
-	additional := initial & 31
-	result.argument = uint64(additional)
-	if additional >= 28 {
-		return result, errors.New("cbor: reserved or indefinite additional information")
-	}
-	if additional >= 24 {
-		width := 1 << (additional - 24)
+	result.start = start
+	result.major = header[0] >> 5
+	result.minor = header[0] & 31
+	result.argument = uint64(result.minor)
+	switch {
+	case result.minor == 31:
+		if result.major >= 2 && result.major <= 5 {
+			return result, newError(ErrUnsupported, start, "indefinite-length item")
+		}
+		return result, newError(ErrMalformed, start, "unexpected break or indefinite-length header")
+	case result.minor >= 28:
+		return result, newError(ErrMalformed, start, "reserved additional information")
+	case result.minor >= 24:
+		width := 1 << (result.minor - 24)
 		encoded, err := parser.read(width)
 		if err != nil {
 			return result, err
@@ -218,76 +295,38 @@ func (parser *parser) item(depth int) (result item, err error) {
 		for _, octet := range encoded {
 			result.argument = result.argument<<8 | uint64(octet)
 		}
-		if result.major != 7 && parser.options.RejectNonMinimal {
-			if result.argument < 24 || (width > 1 && result.argument <= 255) || (width > 2 && result.argument <= 65535) || (width > 4 && result.argument <= math.MaxUint32) {
-				return result, errors.New("cbor: non-minimal argument")
-			}
+		if result.major != 7 && parser.options.RejectNonMinimal && !minimal(result.argument, width) {
+			return result, newError(ErrNotDeterministic, start, "non-minimal argument")
 		}
 	}
 	switch result.major {
-	case 0:
-		result.value = result.argument
 	case 1:
 		if result.argument > math.MaxInt64 {
-			return result, errors.New("cbor: negative integer exceeds int64")
+			return result, newError(ErrUnsupported, start, "negative integer exceeds int64")
 		}
-		result.value = -1 - int64(result.argument)
 	case 2, 3:
 		limit := parser.options.MaxBytes
 		if result.major == 3 {
 			limit = parser.options.MaxStringBytes
 		}
 		if result.argument > uint64(limit) {
-			return result, errors.New("cbor: string size limit exceeded")
+			return result, newError(ErrLimit, start, "string size limit exceeded")
 		}
+		result.payload = len(parser.data)
 		encoded, err := parser.read(int(result.argument))
 		if err != nil {
 			return result, err
 		}
-		if result.major == 2 {
-			result.value = append([]byte{}, encoded...)
-		} else {
-			if !utf8.Valid(encoded) {
-				return result, errors.New("cbor: invalid UTF-8")
-			}
-			result.value = string(encoded)
+		if result.major == 3 && !utf8.Valid(encoded) {
+			return result, newError(ErrInvalid, result.payload, "invalid UTF-8")
 		}
 	case 4, 5:
-		limit := parser.options.MaxArrayElements
-		if result.major == 5 {
-			limit = parser.options.MaxMapPairs
-		}
-		if result.argument > uint64(limit) {
-			return result, errors.New("cbor: container size limit exceeded")
-		}
-		count := result.argument
-		if result.major == 5 {
-			count *= 2
-		}
-		if count > uint64(parser.options.MaxEncodedBytes-len(parser.data)) {
-			return result, errors.New("cbor: container exceeds encoded size limit")
-		}
-		seen := make(map[any]bool)
-		for index := uint64(0); index < count; index++ {
-			child, err := parser.item(depth + 1)
-			if err != nil {
-				return result, err
-			}
-			if result.major == 5 && index%2 == 0 {
-				key, err := comparableKey(child)
-				if err != nil {
-					return result, err
-				}
-				if seen[key] {
-					return result, errors.New("cbor: duplicate map key")
-				}
-				seen[key] = true
-			}
-			result.children = append(result.children, child)
+		if err := parser.container(&result, depth); err != nil {
+			return result, err
 		}
 	case 6:
 		if parser.options.RejectTags {
-			return result, errors.New("cbor: tags forbidden")
+			return result, newError(ErrUnsupported, start, "tags rejected by decoder options")
 		}
 		child, err := parser.item(depth + 1)
 		if err != nil {
@@ -295,69 +334,179 @@ func (parser *parser) item(depth int) (result item, err error) {
 		}
 		result.children = []item{child}
 	case 7:
-		switch additional {
-		case 20:
-			result.value = false
-		case 21:
-			result.value = true
-		case 22:
-			result.value = nil
-		case 23:
-			result.value = SimpleValueUndefined
-		case 25:
-			result.value = halfFloat(uint16(result.argument))
-		case 26:
-			result.value = float64(math.Float32frombits(uint32(result.argument)))
-		case 27:
-			result.value = math.Float64frombits(result.argument)
-		default:
-			return result, errors.New("cbor: unsupported simple value")
+		switch {
+		case result.minor == 24 && result.argument < 32:
+			return result, newError(ErrMalformed, start, "two-byte simple value below 32")
+		case result.isFloat() && parser.options.RequireDeterministic:
+			if minor, bits := shortestFloat(result.float()); minor != result.minor || bits != result.argument {
+				return result, newError(ErrNotDeterministic, start, "floating-point value not in shortest form")
+			}
 		}
 	}
-	result.raw = parser.data[start:len(parser.data):len(parser.data)]
+	result.end = len(parser.data)
 	return result, nil
 }
 
-func halfFloat(bits uint16) float64 {
-	exponent, fraction := (bits>>10)&31, bits&1023
-	var value float64
-	switch exponent {
-	case 0:
-		value = math.Ldexp(float64(fraction), -24)
-	case 31:
-		if fraction == 0 {
-			value = math.Inf(1)
-		} else {
-			value = math.NaN()
+func minimal(argument uint64, width int) bool {
+	switch width {
+	case 1:
+		return argument >= 24
+	case 2:
+		return argument > math.MaxUint8
+	case 4:
+		return argument > math.MaxUint16
+	}
+	return argument > math.MaxUint32
+}
+
+func (parser *parser) container(result *item, depth int) error {
+	limit := parser.options.MaxArrayElements
+	if result.major == 5 {
+		limit = parser.options.MaxMapPairs
+	}
+	if result.argument > uint64(limit) {
+		return newError(ErrLimit, result.start, "container size limit exceeded")
+	}
+	count := result.argument
+	if result.major == 5 {
+		count *= 2
+	}
+	// Every child occupies at least one byte.
+	if count > uint64(parser.options.MaxEncodedBytes-len(parser.data)) {
+		return newError(ErrLimit, result.start, "container exceeds encoded size limit")
+	}
+	result.children = make([]item, 0, smallCapacity(count))
+	var keys keySet
+	for index := uint64(0); index < count; index++ {
+		child, err := parser.item(depth + 1)
+		if err != nil {
+			return err
 		}
-	default:
-		value = math.Ldexp(float64(fraction+1024), int(exponent)-25)
+		if result.major == 5 && index%2 == 0 {
+			if err := keys.add(parser.data, result.children, child); err != nil {
+				return err
+			}
+			if parser.options.RequireDeterministic && index > 0 {
+				previous := result.children[index-2]
+				if bytes.Compare(parser.data[previous.start:previous.end], parser.data[child.start:child.end]) >= 0 {
+					return newError(ErrNotDeterministic, child.start, "map keys not in bytewise lexicographic order")
+				}
+			}
+		}
+		result.children = append(result.children, child)
 	}
-	if bits&0x8000 != 0 {
-		value = -value
-	}
-	return value
+	return nil
 }
 
-func comparableKey(value item) (any, error) {
-	if value.major == 2 {
-		return struct{ bytes string }{string(value.value.([]byte))}, nil
-	}
-	if value.major == 4 || value.major == 5 || value.major == 6 {
-		return nil, errors.New("cbor: composite map keys unsupported")
-	}
-	if number, ok := value.value.(float64); ok && math.IsNaN(number) {
-		return nil, errors.New("cbor: NaN map keys unsupported")
-	}
-	return value.value, nil
+// keyID identifies a map key in the CBOR data model, independent of argument
+// width: integers by value, strings by content, floats by numeric value.
+type keyID struct {
+	kind     byte // major type, or 8 for floating-point values
+	argument uint64
+	text     string
 }
 
-func generic(value item) (any, error) {
+// keySet detects duplicate map keys. Small maps are checked by linear scan
+// without allocating; larger maps switch to a hash set.
+type keySet struct{ ids map[keyID]struct{} }
+
+const linearKeyScan = 16
+
+func (keys *keySet) add(data []byte, children []item, key item) error {
+	if err := checkKeyType(key); err != nil {
+		return err
+	}
+	pairs := len(children) / 2
+	if pairs < linearKeyScan {
+		for index := 0; index < len(children); index += 2 {
+			if sameKey(data, children[index], key) {
+				return newError(ErrInvalid, key.start, "duplicate map key")
+			}
+		}
+		return nil
+	}
+	if keys.ids == nil {
+		keys.ids = make(map[keyID]struct{}, 2*linearKeyScan)
+		for index := 0; index < len(children); index += 2 {
+			keys.ids[identify(data, children[index])] = struct{}{}
+		}
+	}
+	id := identify(data, key)
+	if _, ok := keys.ids[id]; ok {
+		return newError(ErrInvalid, key.start, "duplicate map key")
+	}
+	keys.ids[id] = struct{}{}
+	return nil
+}
+
+func checkKeyType(key item) error {
+	if key.major == 4 || key.major == 5 || key.major == 6 {
+		return newError(ErrUnsupported, key.start, "composite map keys unsupported")
+	}
+	if key.isFloat() && math.IsNaN(key.float()) {
+		return newError(ErrUnsupported, key.start, "NaN map keys unsupported")
+	}
+	return nil
+}
+
+func sameKey(data []byte, left, right item) bool {
+	if left.isFloat() || right.isFloat() {
+		return left.isFloat() && right.isFloat() && left.float() == right.float()
+	}
+	if left.major != right.major || left.argument != right.argument {
+		return false
+	}
+	if left.major == 2 || left.major == 3 {
+		return bytes.Equal(data[left.payload:left.end], data[right.payload:right.end])
+	}
+	return true
+}
+
+func identify(data []byte, key item) keyID {
+	switch {
+	case key.isFloat():
+		number := key.float()
+		if number == 0 {
+			number = 0 // -0 and +0 compare equal, as with sameKey.
+		}
+		return keyID{kind: 8, argument: math.Float64bits(number)}
+	case key.major == 2 || key.major == 3:
+		return keyID{kind: key.major, argument: key.argument, text: string(data[key.payload:key.end])}
+	}
+	return keyID{kind: key.major, argument: key.argument}
+}
+
+// decodeState converts parsed items into Go values. data is the buffer the
+// items' offsets refer to; decoded values never alias it.
+type decodeState struct{ data []byte }
+
+func (state decodeState) raw(value item) []byte { return state.data[value.start:value.end:value.end] }
+
+func (state decodeState) bytes(value item) []byte {
+	return append([]byte{}, state.data[value.payload:value.end]...)
+}
+
+func (state decodeState) text(value item) string { return string(state.data[value.payload:value.end]) }
+
+func (state decodeState) typeError(value item, kind reflect.Type) error {
+	return newError(ErrType, value.start, "item cannot decode into "+kind.String()+" without type mismatch or overflow")
+}
+
+// generic converts an item to the natural Go representation used for any.
+func (state decodeState) generic(value item) (any, error) {
 	switch value.major {
+	case 0:
+		return value.argument, nil
+	case 1:
+		return -1 - int64(value.argument), nil
+	case 2:
+		return state.bytes(value), nil
+	case 3:
+		return state.text(value), nil
 	case 4:
 		values := make([]any, len(value.children))
 		for index, child := range value.children {
-			decoded, err := generic(child)
+			decoded, err := state.generic(child)
 			if err != nil {
 				return nil, err
 			}
@@ -367,14 +516,14 @@ func generic(value item) (any, error) {
 	case 5:
 		values := make(map[any]any, len(value.children)/2)
 		for index := 0; index < len(value.children); index += 2 {
-			key, err := generic(value.children[index])
+			if value.children[index].major == 2 {
+				return nil, newError(ErrType, value.children[index].start, "byte-string map key cannot be represented in map[any]any")
+			}
+			key, err := state.generic(value.children[index])
 			if err != nil {
 				return nil, err
 			}
-			if key != nil && !reflect.TypeOf(key).Comparable() {
-				return nil, errors.New("cbor: map key cannot be represented in Go")
-			}
-			decoded, err := generic(value.children[index+1])
+			decoded, err := state.generic(value.children[index+1])
 			if err != nil {
 				return nil, err
 			}
@@ -382,67 +531,93 @@ func generic(value item) (any, error) {
 		}
 		return values, nil
 	case 6:
-		decoded, err := generic(value.children[0])
-		return TaggedValue{Number: value.argument, Value: decoded}, err
-	default:
-		return value.value, nil
+		decoded, err := state.generic(value.children[0])
+		if err != nil {
+			return nil, err
+		}
+		return TaggedValue{Number: value.argument, Value: decoded}, nil
 	}
+	switch value.minor {
+	case 20:
+		return false, nil
+	case 21:
+		return true, nil
+	case 22:
+		return nil, nil
+	case 25, 26, 27:
+		return value.float(), nil
+	}
+	return SimpleValue(value.argument), nil
 }
 
-func assign(destination reflect.Value, value item) error {
+var (
+	taggedValueType = reflect.TypeOf(TaggedValue{})
+	simpleValueType = reflect.TypeOf(SimpleValue(0))
+	unmarshalerType = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
+)
+
+func (state decodeState) assign(destination reflect.Value, value item) error {
 	if destination.Kind() == reflect.Ptr {
 		destination.Set(reflect.New(destination.Type().Elem()))
-		if decoder, ok := destination.Interface().(Unmarshaler); ok {
-			return decoder.UnmarshalCBOR(value.raw)
+		if destination.Type().Implements(unmarshalerType) {
+			return destination.Interface().(Unmarshaler).UnmarshalCBOR(state.raw(value))
 		}
-		if value.major == 7 && value.value == nil {
+		if value.isNull() {
 			destination.Set(reflect.Zero(destination.Type()))
 			return nil
 		}
-		return assign(destination.Elem(), value)
+		return state.assign(destination.Elem(), value)
 	}
-	if destination.CanAddr() {
-		if decoder, ok := destination.Addr().Interface().(Unmarshaler); ok {
-			return decoder.UnmarshalCBOR(value.raw)
-		}
+	if destination.CanAddr() && reflect.PointerTo(destination.Type()).Implements(unmarshalerType) {
+		return destination.Addr().Interface().(Unmarshaler).UnmarshalCBOR(state.raw(value))
 	}
-	if value.major == 7 && value.value == nil {
+	if value.isNull() {
 		switch destination.Kind() {
 		case reflect.Interface, reflect.Map, reflect.Slice:
 			destination.Set(reflect.Zero(destination.Type()))
 			return nil
 		}
-		return fmt.Errorf("cbor: null cannot decode into %s", destination.Type())
+		return newError(ErrType, value.start, "null cannot decode into "+destination.Type().String())
 	}
 	if destination.Kind() == reflect.Interface {
-		decoded, err := generic(value)
+		decoded, err := state.generic(value)
 		if err != nil {
 			return err
 		}
 		reflected := reflect.ValueOf(decoded)
 		if !reflected.Type().AssignableTo(destination.Type()) {
-			return fmt.Errorf("cbor: value cannot decode into %s", destination.Type())
+			return state.typeError(value, destination.Type())
 		}
 		destination.Set(reflected)
 		return nil
 	}
-	if destination.Type() == reflect.TypeOf(TaggedValue{}) && value.major == 6 {
-		decoded, err := generic(value)
+	switch destination.Type() {
+	case taggedValueType:
+		if value.major != 6 {
+			return state.typeError(value, destination.Type())
+		}
+		decoded, err := state.generic(value)
 		if err != nil {
 			return err
 		}
 		destination.Set(reflect.ValueOf(decoded))
 		return nil
+	case simpleValueType:
+		if value.major != 7 || value.isFloat() {
+			return state.typeError(value, destination.Type())
+		}
+		destination.SetInt(int64(value.argument))
+		return nil
 	}
 	switch destination.Kind() {
 	case reflect.Bool:
-		if decoded, ok := value.value.(bool); ok {
-			destination.SetBool(decoded)
+		if value.major == 7 && (value.minor == 20 || value.minor == 21) {
+			destination.SetBool(value.minor == 21)
 			return nil
 		}
 	case reflect.String:
 		if value.major == 3 {
-			destination.SetString(value.value.(string))
+			destination.SetString(state.text(value))
 			return nil
 		}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -450,7 +625,7 @@ func assign(destination reflect.Value, value item) error {
 		if value.major == 0 && value.argument <= math.MaxInt64 {
 			decoded = int64(value.argument)
 		} else if value.major == 1 {
-			decoded = value.value.(int64)
+			decoded = -1 - int64(value.argument)
 		} else {
 			break
 		}
@@ -464,33 +639,23 @@ func assign(destination reflect.Value, value item) error {
 			return nil
 		}
 	case reflect.Float32, reflect.Float64:
-		if value.major == 0 || value.major == 1 {
-			var decoded float64
-			if value.major == 0 {
-				decoded = float64(value.argument)
-				if decoded >= 18446744073709551616.0 || uint64(decoded) != value.argument {
-					break
-				}
-			} else {
-				number := value.value.(int64)
-				decoded = float64(number)
-				if decoded < -9223372036854775808.0 || decoded >= 9223372036854775808.0 || int64(decoded) != number {
-					break
-				}
+		if value.isFloat() {
+			if decoded := value.float(); !destination.OverflowFloat(decoded) {
+				destination.SetFloat(decoded)
+				return nil
 			}
+			break
+		}
+		if decoded, ok := exactInteger(value); ok {
 			if destination.Kind() == reflect.Float32 && float64(float32(decoded)) != decoded {
 				break
 			}
 			destination.SetFloat(decoded)
 			return nil
 		}
-		if decoded, ok := value.value.(float64); ok && !destination.OverflowFloat(decoded) {
-			destination.SetFloat(decoded)
-			return nil
-		}
 	case reflect.Slice:
 		if value.major == 2 && destination.Type().Elem().Kind() == reflect.Uint8 {
-			destination.SetBytes(append([]byte{}, value.value.([]byte)...))
+			destination.SetBytes(state.bytes(value))
 			return nil
 		}
 		if value.major != 4 {
@@ -498,141 +663,141 @@ func assign(destination reflect.Value, value item) error {
 		}
 		destination.Set(reflect.MakeSlice(destination.Type(), len(value.children), len(value.children)))
 		for index, child := range value.children {
-			if err := assign(destination.Index(index), child); err != nil {
+			if err := state.assign(destination.Index(index), child); err != nil {
 				return err
 			}
 		}
 		return nil
 	case reflect.Array:
+		if value.major == 2 && destination.Type().Elem().Kind() == reflect.Uint8 && uint64(destination.Len()) == value.argument {
+			reflect.Copy(destination, reflect.ValueOf(state.data[value.payload:value.end]))
+			return nil
+		}
 		if value.major != 4 || destination.Len() != len(value.children) {
 			break
 		}
 		for index, child := range value.children {
-			if err := assign(destination.Index(index), child); err != nil {
+			if err := state.assign(destination.Index(index), child); err != nil {
 				return err
 			}
 		}
 		return nil
 	case reflect.Map:
-		if value.major != 5 {
-			break
+		if value.major == 5 {
+			return state.assignMap(destination, value)
 		}
-		destination.Set(reflect.MakeMapWithSize(destination.Type(), len(value.children)/2))
-		for index := 0; index < len(value.children); index += 2 {
-			key := reflect.New(destination.Type().Key()).Elem()
-			entry := reflect.New(destination.Type().Elem()).Elem()
-			if err := assign(key, value.children[index]); err != nil {
-				return err
-			}
-			if key.Kind() == reflect.Interface && !key.IsNil() && !key.Elem().Type().Comparable() {
-				return errors.New("cbor: map key cannot be represented in Go")
-			}
-			if err := assign(entry, value.children[index+1]); err != nil {
-				return err
-			}
-			if destination.MapIndex(key).IsValid() {
-				return errors.New("cbor: duplicate destination map key")
-			}
-			destination.SetMapIndex(key, entry)
-		}
-		return nil
 	case reflect.Struct:
-		if value.major != 5 {
-			break
+		if value.major == 5 {
+			return state.assignStruct(destination, value)
 		}
-		fields, err := fieldsFor(destination.Type())
-		if err != nil {
+	}
+	return state.typeError(value, destination.Type())
+}
+
+// exactInteger converts an integer item to float64 only when the conversion
+// is exact. Float-to-integer coercion is deliberately absent.
+func exactInteger(value item) (float64, bool) {
+	switch value.major {
+	case 0:
+		decoded := float64(value.argument)
+		if decoded >= 0x1p64 || uint64(decoded) != value.argument {
+			return 0, false
+		}
+		return decoded, true
+	case 1:
+		number := -1 - int64(value.argument)
+		decoded := float64(number)
+		if decoded < -0x1p63 || decoded >= 0x1p63 || int64(decoded) != number {
+			return 0, false
+		}
+		return decoded, true
+	}
+	return 0, false
+}
+
+func (state decodeState) assignMap(destination reflect.Value, value item) error {
+	kind := destination.Type()
+	destination.Set(reflect.MakeMapWithSize(kind, len(value.children)/2))
+	for index := 0; index < len(value.children); index += 2 {
+		key := reflect.New(kind.Key()).Elem()
+		entry := reflect.New(kind.Elem()).Elem()
+		if err := state.assign(key, value.children[index]); err != nil {
 			return err
 		}
-		assigned := make(map[int]bool)
-		for index := 0; index < len(value.children); index += 2 {
-			key := value.children[index]
-			selected := -1
-			for _, field := range fields {
-				if key.value == field.key {
-					selected = field.index
-					break
-				}
+		if key.Kind() == reflect.Interface && !key.IsNil() && !key.Elem().Type().Comparable() {
+			return newError(ErrType, value.children[index].start, "map key cannot be represented in Go")
+		}
+		if err := state.assign(entry, value.children[index+1]); err != nil {
+			return err
+		}
+		if destination.MapIndex(key).IsValid() {
+			return newError(ErrInvalid, value.children[index].start, "duplicate destination map key")
+		}
+		destination.SetMapIndex(key, entry)
+	}
+	return nil
+}
+
+func (state decodeState) assignStruct(destination reflect.Value, value item) error {
+	fields, err := fieldsFor(destination.Type())
+	if err != nil {
+		return err
+	}
+	var assigned []bool
+	for index := 0; index < len(value.children); index += 2 {
+		key := value.children[index]
+		selected := -1
+		for position := range fields {
+			if fields[position].matches(state.data, key) {
+				selected = position
+				break
 			}
-			if selected < 0 && key.major == 3 {
-				for _, field := range fields {
-					if name, ok := field.key.(string); ok && strings.EqualFold(name, key.value.(string)) {
-						if selected >= 0 {
-							return errors.New("cbor: ambiguous struct field")
-						}
-						selected = field.index
+		}
+		if selected < 0 && key.major == 3 {
+			name := state.data[key.payload:key.end]
+			for position := range fields {
+				if fields[position].keyKind == 3 && bytes.EqualFold([]byte(fields[position].name), name) {
+					if selected >= 0 {
+						return newError(ErrType, key.start, "ambiguous struct field")
 					}
-				}
-			}
-			if selected >= 0 {
-				if assigned[selected] {
-					return errors.New("cbor: duplicate destination struct field")
-				}
-				assigned[selected] = true
-				if err := assign(destination.Field(selected), value.children[index+1]); err != nil {
-					return err
+					selected = position
 				}
 			}
 		}
-		return nil
+		if selected < 0 {
+			continue
+		}
+		if assigned == nil {
+			assigned = make([]bool, len(fields))
+		}
+		if assigned[selected] {
+			return newError(ErrInvalid, key.start, "duplicate destination struct field")
+		}
+		assigned[selected] = true
+		if err := state.assign(destination.Field(fields[selected].index), value.children[index+1]); err != nil {
+			return err
+		}
 	}
-	return fmt.Errorf("cbor: item cannot decode into %s without type mismatch or overflow", destination.Type())
+	return nil
 }
 
+func (field *structField) matches(data []byte, key item) bool {
+	if key.major != field.keyKind {
+		return false
+	}
+	if field.keyKind == 3 {
+		return string(data[key.payload:key.end]) == field.name
+	}
+	return key.argument == field.number
+}
+
+// structField is cached per struct type and holds no reference to decoded or
+// encoded values.
 type structField struct {
-	index     int
-	key       any
-	omitEmpty bool
-}
-
-func fieldsFor(kind reflect.Type) ([]structField, error) {
-	var fields []structField
-	seen := make(map[any]bool)
-	for index := 0; index < kind.NumField(); index++ {
-		field := kind.Field(index)
-		if field.PkgPath != "" {
-			continue
-		}
-		tag := strings.Split(field.Tag.Get("cbor"), ",")
-		if tag[0] == "-" {
-			continue
-		}
-		name := tag[0]
-		if name == "" {
-			name = field.Name
-		}
-		metadata := structField{index: index, key: name}
-		for _, option := range tag[1:] {
-			switch option {
-			case "keyasint":
-				if strings.HasPrefix(name, "-") {
-					number, err := strconv.ParseInt(name, 10, 64)
-					if err != nil {
-						return nil, errors.New("cbor: invalid integer field key")
-					}
-					metadata.key = number
-					if number == 0 {
-						metadata.key = uint64(0)
-					}
-				} else {
-					number, err := strconv.ParseUint(name, 10, 64)
-					if err != nil {
-						return nil, errors.New("cbor: invalid integer field key")
-					}
-					metadata.key = number
-				}
-			case "omitempty":
-				metadata.omitEmpty = true
-			case "":
-			default:
-				return nil, errors.New("cbor: unsupported field tag option")
-			}
-		}
-		if seen[metadata.key] {
-			return nil, errors.New("cbor: duplicate struct field key")
-		}
-		seen[metadata.key] = true
-		fields = append(fields, metadata)
-	}
-	return fields, nil
+	index      int
+	keyKind    byte   // 0 (unsigned), 1 (negative) or 3 (text)
+	number     uint64 // CBOR argument for integer keys
+	name       string // text key, or the field name for integer keys
+	encodedKey []byte // preferred encoding of the key
+	omitEmpty  bool
 }

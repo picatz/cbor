@@ -20,8 +20,8 @@ func ExampleDecoder() {
 		panic(err)
 	}
 
-	// Output: world
 	fmt.Println(value["hello"])
+	// Output: world
 }
 
 func TestDecoderStructTag(t *testing.T) {
@@ -32,13 +32,12 @@ func TestDecoderStructTag(t *testing.T) {
 	}
 
 	var value example
-	err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value)
-	if err != nil {
-		panic(err)
+	if err := cbor.NewDecoder(bytes.NewBufferString(data)).Decode(&value); err != nil {
+		t.Fatal(err)
 	}
-
-	// Output: world
-	fmt.Println(value.Hello)
+	if value.Hello != "world" {
+		t.Fatalf("got %q", value.Hello)
+	}
 }
 
 type testStructHello struct {

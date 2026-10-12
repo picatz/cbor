@@ -17,4 +17,33 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: go test -race ./...
       - run: go vet ./...
-      - run: go test -run '^$' -fuzz FuzzDecode -fuzztime 15s -parallel 2
+      - run: |
+          for target in FuzzDecode FuzzRoundTrip FuzzStream FuzzShortestFloat; do
+            go test -run '^$' -fuzz "^${target}\$" -fuzztime 15s -parallel 2 .
+          done
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # The js/wasm runner limits the environment size, so run with a minimal one.
+      - run: env -i PATH="$PATH" HOME="$HOME" GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./...
+  interop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: interop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: interop/go.sum
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go test -run '^$' -fuzz FuzzDifferential -fuzztime 30s -parallel 2 .
