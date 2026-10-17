@@ -37,6 +37,11 @@ type DecoderOptions struct {
 	MaxEncodedBytes  int
 	RejectTags       bool
 
+	// RejectUnknownFields fails struct decoding with ErrType when a map key
+	// matches no field's key exactly. It also disables the case-insensitive
+	// fallback for text keys, so each key has exactly one spelling.
+	RejectUnknownFields bool
+
 	// RejectNonMinimal rejects integer, length and tag arguments that are not
 	// encoded in their shortest form.
 	RejectNonMinimal bool
@@ -65,7 +70,15 @@ var DefaultDecoderOptions = DecoderOptions{
 type Decoder struct {
 	reader  io.Reader
 	options DecoderOptions
+
+	// buffer is the previous item's storage, reused for the next one. Decoded
+	// values never alias it, and Unmarshaler implementations must already
+	// copy what they retain.
+	buffer []byte
 }
+
+// maxRetainedBuffer bounds the storage a Decoder keeps after a large item.
+const maxRetainedBuffer = 64 << 10
 
 // NewDecoder constructs a decoder with a snapshot of DefaultDecoderOptions.
 func NewDecoder(reader io.Reader) *Decoder {
@@ -146,7 +159,7 @@ func (options DecoderOptions) Unmarshal(data []byte, destination any) error {
 	if len(parser.data) != len(data) {
 		return newError(ErrMalformed, len(parser.data), "trailing data")
 	}
-	return store(target, parser.data, root)
+	return store(target, options, parser.data, root)
 }
 
 // Decode reads one item. Clean stream exhaustion returns io.EOF; truncated
@@ -163,12 +176,15 @@ func (decoder *Decoder) Decode(destination any) error {
 	if err != nil {
 		return err
 	}
-	parser := parser{reader: decoder.reader, options: options}
+	parser := parser{reader: decoder.reader, options: options, data: decoder.buffer[:0]}
 	root, err := parser.item(0)
-	if err != nil {
-		return err
+	if err == nil {
+		err = store(target, options, parser.data, root)
 	}
-	return store(target, parser.data, root)
+	if cap(parser.data) <= maxRetainedBuffer {
+		decoder.buffer = parser.data
+	}
+	return err
 }
 
 func destinationValue(destination any) (reflect.Value, error) {
@@ -181,9 +197,9 @@ func destinationValue(destination any) (reflect.Value, error) {
 
 // store decodes into a fresh value and replaces the destination only on
 // success, so failed decodes leave it unchanged.
-func store(target reflect.Value, data []byte, root item) error {
+func store(target reflect.Value, options DecoderOptions, data []byte, root item) error {
 	replacement := reflect.New(target.Elem().Type()).Elem()
-	state := decodeState{data: data}
+	state := decodeState{data: data, unknownFields: options.RejectUnknownFields}
 	if err := state.assign(replacement, root); err != nil {
 		return err
 	}
@@ -478,7 +494,10 @@ func identify(data []byte, key item) keyID {
 
 // decodeState converts parsed items into Go values. data is the buffer the
 // items' offsets refer to; decoded values never alias it.
-type decodeState struct{ data []byte }
+type decodeState struct {
+	data          []byte
+	unknownFields bool // reject keys that match no struct field exactly
+}
 
 func (state decodeState) raw(value item) []byte { return state.data[value.start:value.end:value.end] }
 
@@ -752,6 +771,9 @@ func (state decodeState) assignStruct(destination reflect.Value, value item) err
 				selected = position
 				break
 			}
+		}
+		if selected < 0 && state.unknownFields {
+			return newError(ErrType, key.start, "unknown struct field")
 		}
 		if selected < 0 && key.major == 3 {
 			name := state.data[key.payload:key.end]

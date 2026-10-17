@@ -91,7 +91,9 @@ Duplicate keys are detected in the CBOR data model, so `1` and `0x1801`, or
 `1.0` as binary16 and binary64, collide. Reused destination maps, slices and
 structs are replaced on success and unchanged on an error, apart from side
 effects inside application-provided `UnmarshalCBOR` methods. Unknown struct
-fields are fully validated before being ignored. Struct metadata is cached per
+fields are fully validated before being ignored, or rejected with `ErrType`
+when `RejectUnknownFields` is set; that option also turns off case-insensitive
+field matching, so each key has exactly one accepted spelling. Struct metadata is cached per
 type and never references a decoded or encoded value.
 
 Decoded byte slices, strings and `RawMessage` values never alias the input.

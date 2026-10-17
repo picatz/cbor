@@ -326,3 +326,77 @@ func TestNestingSymmetry(t *testing.T) {
 		t.Fatalf("65 levels: %v", err)
 	}
 }
+
+// TestDecoderBufferReuse checks that values decoded from a stream stay intact
+// when the Decoder reuses its buffer for the next item.
+func TestDecoderBufferReuse(t *testing.T) {
+	stream := []byte{0x42, 1, 2, 0x82, 0x41, 3, 0x61, 'a', 0x42, 4, 5, 0x42, 6, 7}
+	decoder := cbor.NewDecoder(iotest.OneByteReader(bytes.NewReader(stream)))
+	var raw cbor.RawMessage
+	var generic any
+	var data []byte
+	var array [2]byte
+	for _, destination := range []any{&raw, &generic, &data, &array} {
+		if err := decoder.Decode(destination); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !bytes.Equal(raw, []byte{0x42, 1, 2}) || !bytes.Equal(data, []byte{4, 5}) || array != [2]byte{6, 7} {
+		t.Fatalf("values changed: %x %x %x", raw, data, array)
+	}
+	if want := []any{[]byte{3}, "a"}; !reflect.DeepEqual(generic, want) {
+		t.Fatalf("generic = %#v", generic)
+	}
+	// A failed item must not disturb earlier results either.
+	if err := decoder.Decode(&raw); err != io.EOF {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, []byte{0x42, 1, 2}) {
+		t.Fatalf("raw changed on EOF: %x", raw)
+	}
+}
+
+func TestRejectUnknownFields(t *testing.T) {
+	type header struct {
+		Algorithm int    `cbor:"1,keyasint"`
+		KeyID     []byte `cbor:"4,keyasint"`
+		Name      string `cbor:"name,omitempty"`
+	}
+	strict := cbor.DecoderOptions{RejectUnknownFields: true}
+	for _, test := range []struct {
+		value any
+		err   error
+	}{
+		{map[any]any{uint64(1): -7, uint64(4): []byte("k")}, nil},
+		{map[any]any{uint64(1): -7, "name": "n"}, nil},
+		{map[any]any{uint64(1): -7, uint64(5): true}, cbor.ErrType},
+		{map[any]any{uint64(1): -7, "Name": "n"}, cbor.ErrType}, // no case-insensitive fallback
+		{map[any]any{uint64(1): -7, "1": 0}, cbor.ErrType},      // text "1" is not integer key 1
+	} {
+		encoded, err := cbor.Marshal(test.value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded header
+		err = strict.Unmarshal(encoded, &decoded)
+		if test.err == nil && err != nil || test.err != nil && !errors.Is(err, test.err) {
+			t.Errorf("%x: %v, want %v", encoded, err, test.err)
+		}
+		// The default stays lenient.
+		if err := cbor.Unmarshal(encoded, &decoded); err != nil {
+			t.Errorf("%x: default decoder: %v", encoded, err)
+		}
+	}
+	// Nested structs, including through slices and pointers, are strict too.
+	type outer struct {
+		Headers []*header `cbor:"h"`
+	}
+	encoded, _ := cbor.Marshal(map[string]any{"h": []any{map[any]any{uint64(9): 1}}})
+	if err := strict.Unmarshal(encoded, new(outer)); !errors.Is(err, cbor.ErrType) {
+		t.Fatalf("nested unknown field: %v", err)
+	}
+	// Maps are not structs, so their keys stay unrestricted.
+	if err := strict.Unmarshal(encoded, new(map[string]any)); err != nil {
+		t.Fatal(err)
+	}
+}

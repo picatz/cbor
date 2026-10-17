@@ -114,3 +114,17 @@ func ExampleError() {
 	}
 	// Output: true 3 duplicate map key
 }
+
+func ExampleDecoderOptions_rejectUnknownFields() {
+	type header struct {
+		Algorithm int    `cbor:"1,keyasint"`
+		KeyID     []byte `cbor:"4,keyasint"`
+	}
+	strict := cbor.DecoderOptions{RejectUnknownFields: true, RequireDeterministic: true}
+
+	// {1: -7, 4: h'6b', 5: true}: key 5 is not part of the header.
+	var decoded header
+	err := strict.Unmarshal([]byte{0xa3, 0x01, 0x26, 0x04, 0x41, 0x6b, 0x05, 0xf5}, &decoded)
+	fmt.Println(errors.Is(err, cbor.ErrType), err)
+	// Output: true cbor: unknown struct field at offset 6
+}
