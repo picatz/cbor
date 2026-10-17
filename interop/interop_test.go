@@ -206,6 +206,19 @@ func TestDeterministicEncodingMatchesReference(t *testing.T) {
 			Crv  int    `cbor:"-1,keyasint"`
 			Name string `cbor:"name"`
 		}{Alg: -7, Kty: 2, Crv: 1, Name: "p256"},
+		struct {
+			_         struct{} `cbor:",toarray"`
+			Protected []byte
+			Header    map[int64][]byte
+			Payload   []byte
+			Signature []byte
+		}{Protected: []byte{0xa1, 0x01, 0x26}, Header: map[int64][]byte{4: []byte("11")}, Signature: []byte{1, 2}},
+		struct {
+			Count int      `cbor:"1,keyasint,omitzero"`
+			Empty []int    `cbor:"2,keyasint,omitzero"`
+			Ptr   *int     `cbor:"3,keyasint,omitzero"`
+			Pair  [2]uint8 `cbor:"4,keyasint,omitzero"`
+		}{Empty: []int{}},
 	}
 	for _, value := range values {
 		ours, err := cbor.CoreDeterministicEncoding().Marshal(value)

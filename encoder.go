@@ -176,6 +176,11 @@ func (state *encodeState) encode(output []byte, value reflect.Value, depth int) 
 	if valueType.NumMethod() > 0 && valueType.Implements(marshalerType) && value.CanInterface() {
 		return state.encodeMarshaler(output, value.Interface().(Marshaler), depth)
 	}
+	// Implements, not NumMethod, because tagEncoder's method is unexported.
+	if kind == reflect.Struct && valueType.Implements(tagEncoderType) && value.CanInterface() {
+		number, content := value.Interface().(tagEncoder).cborTag()
+		return state.encode(appendHeader(output, 6, number), content, depth+1)
+	}
 	switch valueType {
 	case taggedValueType:
 		if !value.CanInterface() {
@@ -357,14 +362,28 @@ func (state *encodeState) writePairs(output []byte, pairs []encodedPair, depth i
 }
 
 func (state *encodeState) encodeStruct(output []byte, value reflect.Value, depth int) ([]byte, error) {
-	fields, err := fieldsFor(value.Type())
+	info, err := structFor(value.Type())
 	if err != nil {
 		return nil, err
+	}
+	fields := info.fields
+	if info.toArray {
+		output = appendHeader(output, 4, uint64(len(fields)))
+		for index := range fields {
+			output, err = state.encode(output, value.Field(fields[index].index), depth+1)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if len(output) > maxEncodedItem {
+			return nil, errSizeLimit
+		}
+		return output, nil
 	}
 	pairs := make([]encodedPair, 0, len(fields))
 	for index := range fields {
 		entry := value.Field(fields[index].index)
-		if fields[index].omitEmpty && emptyValue(entry) {
+		if fields[index].omit(entry) {
 			continue
 		}
 		pairs = append(pairs, encodedPair{key: fields[index].encodedKey, value: entry})

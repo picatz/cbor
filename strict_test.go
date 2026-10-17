@@ -253,7 +253,7 @@ func FuzzDecode(fuzzer *testing.F) {
 			t.Skip()
 		}
 		options := cbor.DecoderOptions{MaxEncodedBytes: 8192, MaxNestedLevels: 16, MaxArrayElements: 256, MaxMapPairs: 128, MaxBytes: 8192, MaxStringBytes: 8192}
-		for _, destination := range []any{new(any), new(map[uint64]cbor.RawMessage), new(map[string]bool), new([]string), new(int8), new(float32), new(struct{ Value bool })} {
+		for _, destination := range []any{new(any), new(map[uint64]cbor.RawMessage), new(map[string]bool), new([]string), new(int8), new(float32), new(struct{ Value bool }), new(cbor.Tag[coseSign1]), new(coseSign1), new([4]byte)} {
 			_ = options.Unmarshal(data, destination)
 		}
 		var raw cbor.RawMessage

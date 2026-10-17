@@ -610,6 +610,13 @@ func (state decodeState) assign(destination reflect.Value, value item) error {
 		destination.Set(reflected)
 		return nil
 	}
+	if destination.CanAddr() && reflect.PointerTo(destination.Type()).Implements(tagDecoderType) {
+		if value.major != 6 {
+			return state.typeError(value, destination.Type())
+		}
+		content := destination.Addr().Interface().(tagDecoder).cborTagTarget(value.argument)
+		return state.assign(content, value.children[0])
+	}
 	switch destination.Type() {
 	case taggedValueType:
 		if value.major != 6 {
@@ -706,7 +713,7 @@ func (state decodeState) assign(destination reflect.Value, value item) error {
 			return state.assignMap(destination, value)
 		}
 	case reflect.Struct:
-		if value.major == 5 {
+		if value.major == 4 || value.major == 5 {
 			return state.assignStruct(destination, value)
 		}
 	}
@@ -758,9 +765,24 @@ func (state decodeState) assignMap(destination reflect.Value, value item) error 
 }
 
 func (state decodeState) assignStruct(destination reflect.Value, value item) error {
-	fields, err := fieldsFor(destination.Type())
+	info, err := structFor(destination.Type())
 	if err != nil {
 		return err
+	}
+	if info.toArray != (value.major == 4) {
+		return state.typeError(value, destination.Type())
+	}
+	fields := info.fields
+	if info.toArray {
+		if len(value.children) != len(fields) {
+			return newError(ErrType, value.start, "array length does not match the fields of "+destination.Type().String())
+		}
+		for index, child := range value.children {
+			if err := state.assign(destination.Field(fields[index].index), child); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	var assigned []bool
 	for index := 0; index < len(value.children); index += 2 {
@@ -822,4 +844,5 @@ type structField struct {
 	name       string // text key, or the field name for integer keys
 	encodedKey []byte // preferred encoding of the key
 	omitEmpty  bool
+	omitZero   bool
 }

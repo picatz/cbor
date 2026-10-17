@@ -137,7 +137,7 @@ must already be deterministic, or encoding fails with `ErrNotDeterministic`.
   representable. Float-to-integer coercion is not supported.
 - Null decodes to nil pointers, interfaces, maps, and slices. Null into a scalar
   is an error. Undefined and unassigned simple values decode as `SimpleValue`.
-- Tags are preserved as `TaggedValue`; application-specific date/URL/bignum
+- Tags are preserved as `TaggedValue` or `Tag[T]`; application-specific date/URL/bignum
   interpretation and tag-content validation are not performed. `RejectTags`
   disables tags altogether.
 - Generic maps use `map[any]any`. Composite and NaN map keys are unsupported.
@@ -146,8 +146,15 @@ must already be deterministic, or encoding fails with `ErrNotDeterministic`.
 - `[]byte` and byte arrays such as `[16]byte` encode as byte strings. Byte
   strings decode into `[]byte` and into byte arrays of exactly matching length,
   such as a 16-byte AAGUID into `[16]byte`.
-- Exported struct fields support `cbor:"name"`, `keyasint`, `omitempty`, and `-`.
-  Decoding prefers exact field names, then unambiguous case-insensitive matches.
+- Exported struct fields support `cbor:"name"`, `keyasint`, `omitempty`,
+  `omitzero` (zero value, or an `IsZero() bool` method), and `-`. Decoding
+  prefers exact field names, then unambiguous case-insensitive matches.
+- A blank field `_ struct{} \`cbor:",toarray"\`` encodes a struct as an array of
+  its fields in declaration order, as COSE and CWT structures require. Decoding
+  requires exactly that many elements.
+- `Tag[T]` carries a tag with typed content, such as `Tag[Sign1]` for a
+  COSE_Sign1 message; `TaggedValue` keeps untyped content. `Tag*` constants
+  name the RFC 8949 tag numbers.
 - Encoders cap items at 1 MiB, nesting at 64 levels, and arrays/maps at 10,000
   entries. Any value the default decoder produces re-encodes within the nesting
   limit; binary64 floats can make the re-encoding larger than its input.

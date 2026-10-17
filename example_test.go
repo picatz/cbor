@@ -128,3 +128,35 @@ func ExampleDecoderOptions_rejectUnknownFields() {
 	fmt.Println(errors.Is(err, cbor.ErrType), err)
 	// Output: true cbor: unknown struct field at offset 6
 }
+
+func ExampleTag() {
+	// A COSE_Sign1 message (RFC 9052 Section 4.2) is tag 18 around a
+	// four-element array, so its struct uses toarray.
+	type sign1 struct {
+		_           struct{} `cbor:",toarray"`
+		Protected   []byte
+		Unprotected map[int64]cbor.RawMessage
+		Payload     []byte
+		Signature   []byte
+	}
+	message := cbor.Tag[sign1]{Number: 18, Content: sign1{
+		Protected:   []byte{0xa1, 0x01, 0x26}, // {1: -7}, alg ES256
+		Unprotected: map[int64]cbor.RawMessage{},
+		Payload:     []byte("hi"),
+		Signature:   []byte{0x01},
+	}}
+	encoded, err := cbor.CoreDeterministicEncoding().Marshal(message)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("%x\n", encoded)
+
+	var decoded cbor.Tag[sign1]
+	if err := cbor.Unmarshal(encoded, &decoded); err != nil {
+		panic(err)
+	}
+	fmt.Println(decoded.Number, string(decoded.Content.Payload))
+	// Output:
+	// d28443a10126a04268694101
+	// 18 hi
+}

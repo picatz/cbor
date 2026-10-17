@@ -9,31 +9,51 @@ import (
 	"unicode/utf8"
 )
 
-type cachedFields struct {
-	fields []structField
-	err    error
+// structInfo describes how a struct type maps to CBOR.
+type structInfo struct {
+	fields []structField // in declaration order
+
+	// toArray encodes the struct as an array of its fields in declaration
+	// order instead of a map, as COSE and CWT structures require. It is set
+	// by a blank field tagged `cbor:",toarray"`.
+	toArray bool
 }
 
-// fieldCache maps a struct reflect.Type to its cachedFields. Entries describe
+type cachedStruct struct {
+	info *structInfo
+	err  error
+}
+
+// structCache maps a struct reflect.Type to its cachedStruct. Entries describe
 // types only, so the cache never retains decoded or encoded values.
-var fieldCache sync.Map
+var structCache sync.Map
 
-// fieldsFor returns the CBOR fields of a struct type in declaration order.
-func fieldsFor(kind reflect.Type) ([]structField, error) {
-	if cached, ok := fieldCache.Load(kind); ok {
-		entry := cached.(cachedFields)
-		return entry.fields, entry.err
+// structFor returns the CBOR mapping of a struct type.
+func structFor(kind reflect.Type) (*structInfo, error) {
+	if cached, ok := structCache.Load(kind); ok {
+		entry := cached.(cachedStruct)
+		return entry.info, entry.err
 	}
-	fields, err := computeFields(kind)
-	fieldCache.Store(kind, cachedFields{fields: fields, err: err})
-	return fields, err
+	info, err := computeStruct(kind)
+	structCache.Store(kind, cachedStruct{info: info, err: err})
+	return info, err
 }
 
-func computeFields(kind reflect.Type) ([]structField, error) {
-	var fields []structField
+func computeStruct(kind reflect.Type) (*structInfo, error) {
+	info := new(structInfo)
 	seen := make(map[keyID]bool)
 	for index := 0; index < kind.NumField(); index++ {
 		field := kind.Field(index)
+		if field.Name == "_" {
+			switch field.Tag.Get("cbor") {
+			case ",toarray":
+				info.toArray = true
+			case "":
+			default:
+				return nil, errors.New("cbor: unsupported tag on blank field")
+			}
+			continue
+		}
 		if field.PkgPath != "" {
 			continue
 		}
@@ -68,6 +88,10 @@ func computeFields(kind reflect.Type) ([]structField, error) {
 				}
 			case "omitempty":
 				metadata.omitEmpty = true
+			case "omitzero":
+				metadata.omitZero = true
+			case "toarray":
+				return nil, errors.New("cbor: toarray belongs on a blank field: _ struct{} `cbor:\",toarray\"`")
 			case "":
 			default:
 				return nil, errors.New("cbor: unsupported field tag option")
@@ -87,7 +111,33 @@ func computeFields(kind reflect.Type) ([]structField, error) {
 			return nil, errors.New("cbor: duplicate struct field key")
 		}
 		seen[id] = true
-		fields = append(fields, metadata)
+		info.fields = append(info.fields, metadata)
 	}
-	return fields, nil
+	if info.toArray {
+		for _, field := range info.fields {
+			if field.omitEmpty || field.omitZero {
+				return nil, errors.New("cbor: toarray structs cannot omit fields")
+			}
+		}
+	}
+	return info, nil
 }
+
+// omit reports whether an omitempty or omitzero field is left out.
+func (field *structField) omit(value reflect.Value) bool {
+	if field.omitEmpty && emptyValue(value) {
+		return true
+	}
+	if !field.omitZero {
+		return false
+	}
+	if value.Type().Implements(isZeroerType) {
+		if value.Kind() == reflect.Pointer && value.IsNil() {
+			return true
+		}
+		return value.Interface().(interface{ IsZero() bool }).IsZero()
+	}
+	return value.IsZero()
+}
+
+var isZeroerType = reflect.TypeOf((*interface{ IsZero() bool })(nil)).Elem()
