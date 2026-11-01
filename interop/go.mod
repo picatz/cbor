@@ -1,6 +1,6 @@
 module github.com/picatz/cbor/interop
 
-go 1.24
+go 1.26
 
 require (
 	github.com/fxamacker/cbor/v2 v2.9.6

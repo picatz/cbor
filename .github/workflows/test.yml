@@ -4,31 +4,42 @@ on:
   pull_request:
 permissions:
   contents: read
+
+# Actions are pinned to full commit SHAs; Dependabot proposes updates.
+env:
+  GOVULNCHECK_VERSION: v1.9.0
+
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go: ['1.19.x', 'stable']
+        # The minimum from go.mod and the latest release.
+        go: ['1.26.x', 'stable']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go }}
-      - run: go test -race ./...
+      - run: test -z "$(gofmt -l . | tee /dev/stderr)"
       - run: go vet ./...
+      - run: go test -race ./...
       - run: |
-          for target in FuzzDecode FuzzRoundTrip FuzzStream FuzzShortestFloat; do
+          for target in FuzzDecode FuzzRoundTrip FuzzStream FuzzShortestFloat FuzzDiagnose FuzzSchema FuzzCOSE; do
             go test -run '^$' -fuzz "^${target}\$" -fuzztime 15s -parallel 2 .
           done
   wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: stable
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       # The js/wasm runner limits the environment size, so run with a minimal one.
@@ -39,11 +50,26 @@ jobs:
       run:
         working-directory: interop
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           cache-dependency-path: interop/go.sum
-      - run: go test -race ./...
       - run: go vet ./...
+      - run: go test -race ./...
       - run: go test -run '^$' -fuzz FuzzDifferential -fuzztime 30s -parallel 2 .
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache-dependency-path: interop/go.sum
+      - run: go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...
+        working-directory: interop

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 
 	"github.com/picatz/cbor"
 )
@@ -159,4 +161,92 @@ func ExampleTag() {
 	// Output:
 	// d28443a10126a04268694101
 	// 18 hi
+}
+
+func ExampleDiagnose() {
+	// A COSE header, {1: -7, 4: h'3131'}: alg ES256 and kid "11".
+	notation, err := cbor.Diagnose([]byte{0xa2, 0x01, 0x26, 0x04, 0x42, 0x31, 0x31})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(notation)
+	// Output: {1: -7, 4: h'3131'}
+}
+
+func ExampleDecoder_All() {
+	// An RFC 8742 CBOR sequence: 1, "hi", [true].
+	stream := bytes.NewReader([]byte{0x01, 0x62, 'h', 'i', 0x81, 0xf5})
+	for item, err := range cbor.NewDecoder(stream).All() {
+		if err != nil {
+			panic(err)
+		}
+		notation, _ := cbor.Diagnose(item)
+		fmt.Println(notation)
+	}
+	// Output:
+	// 1
+	// "hi"
+	// [true]
+}
+
+func ExampleAppendMarshal() {
+	// Frame several items in one buffer, here after a self-described CBOR tag.
+	buffer := []byte{0xd9, 0xd9, 0xf7}
+	for _, value := range []any{1, "a"} {
+		var err error
+		if buffer, err = cbor.AppendMarshal(buffer, value); err != nil {
+			panic(err)
+		}
+	}
+	fmt.Printf("%x\n", buffer)
+	// Output: d9d9f7016161
+}
+
+// Struct-wide integer keys and required fields describe a COSE_Key
+// (RFC 9052 Section 7) strictly enough that no hand-written map walking is
+// needed. Common parameters can live in an embedded struct.
+func Example_integerKeys() {
+	type keyCommon struct {
+		_         struct{} `cbor:",keyasint"`
+		KeyType   int64    `cbor:"1,required"`
+		KeyID     []byte   `cbor:"2,omitempty"`
+		Algorithm int64    `cbor:"3,omitempty"`
+	}
+	type ec2Key struct {
+		keyCommon
+		_     struct{} `cbor:",keyasint"`
+		Curve int64    `cbor:"-1,required"`
+		X     []byte   `cbor:"-2,required"`
+	}
+	strict := cbor.DecoderOptions{RejectUnknownFields: true, RequireDeterministic: true}
+
+	// {1: 2, 3: -7, -1: 1, -2: h'01'}
+	var key ec2Key
+	err := strict.Unmarshal([]byte{0xa4, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x41, 0x01}, &key)
+	fmt.Println(key.KeyType, key.Algorithm, key.Curve, key.X, err)
+
+	// {1: 2, -2: h'01'}: the curve is missing.
+	err = strict.Unmarshal([]byte{0xa2, 0x01, 0x02, 0x21, 0x41, 0x01}, &key)
+	fmt.Println(err)
+	// Output:
+	// 2 -7 1 [1] <nil>
+	// cbor: missing required field -1 (Curve) of cbor_test.ec2Key at offset 0
+}
+
+func Example_bigInt() {
+	// 2^64 needs a bignum (tag 2); 2^64 - 1 fits an unsigned integer.
+	for _, value := range []*big.Int{
+		new(big.Int).Lsh(big.NewInt(1), 64),
+		new(big.Int).SetUint64(math.MaxUint64),
+	} {
+		encoded, err := cbor.Marshal(value)
+		if err != nil {
+			panic(err)
+		}
+		notation, _ := cbor.Diagnose(encoded)
+		fmt.Println(notation)
+	}
+	// Output:
+	// 2(h'010000000000000000')
+	// 18446744073709551615
 }

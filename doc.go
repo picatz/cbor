@@ -1,5 +1,6 @@
 // Package cbor implements a bounded Concise Binary Object Representation
-// (CBOR) encoder and decoder in the style of encoding/json.
+// (CBOR) encoder and decoder in the style of encoding/json, for security
+// protocols such as COSE, CWT, WebAuthn and CTAP2.
 //
 // # Profile
 //
@@ -7,16 +8,35 @@
 // accepts every well-formed, valid item except:
 //
 //   - indefinite-length strings, arrays and maps;
-//   - negative integers below math.MinInt64;
 //   - array, map, tag and NaN map keys;
 //   - items over the DecoderOptions resource limits.
 //
 // Those items fail with ErrUnsupported or ErrLimit. Items that are not
 // well-formed fail with ErrMalformed and invalid items, such as maps with
 // duplicate keys (compared in the CBOR data model, so 1 and 0x1801 collide)
-// or text with invalid UTF-8, fail with ErrInvalid. Tags are preserved as
-// TaggedValue without interpreting or validating their content; simple values
-// other than false, true, null and the floats decode as SimpleValue.
+// or text with invalid UTF-8, fail with ErrInvalid. The whole item is
+// validated before any of it is decoded. Tags are preserved as TaggedValue or
+// Tag without interpreting their content, except that bignums (tags 2 and 3)
+// decode into big.Int; simple values other than false, true, null and the
+// floats decode as SimpleValue.
+//
+// # Struct tags
+//
+// Struct fields map to text keys by default. The tag `cbor:"-7,keyasint"`
+// selects integer key -7, and a blank field tagged `cbor:",keyasint"` makes
+// every field's name an integer key, as COSE and CWT use:
+//
+//	type Claims struct {
+//		_          struct{} `cbor:",keyasint"`
+//		Issuer     string   `cbor:"1,omitempty"`
+//		Expiration int64    `cbor:"4,required"`
+//	}
+//
+// A blank field tagged `cbor:",toarray"` encodes the struct as an array of
+// its fields. The options omitempty and omitzero omit fields when encoding,
+// and required fails decoding with ErrType when a field's key is absent.
+// Fields of embedded structs are promoted as in encoding/json, except that
+// two fields with one key at the same depth are an error.
 //
 // # Encoding contracts
 //

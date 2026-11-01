@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -60,6 +62,13 @@ func compare(t *testing.T, data []byte) {
 		// null and undefined are distinct simple values, but the reference
 		// decodes both to a Go nil and then reports them as duplicates.
 		return
+	case ours == nil && reference != nil && strings.Contains(reference.Error(), "invalid map key type: big.Int"):
+		// Neither library can hold a bignum key in map[any]any; the item
+		// itself is valid.
+		if err := cbor.Unmarshal(data, new(any)); !errors.Is(err, cbor.ErrType) {
+			t.Fatalf("%x: bignum map key into any: %v, want ErrType", data, err)
+		}
+		return
 	case ours == nil && reference != nil:
 		t.Fatalf("%x: accepted, reference rejected: %v", data, reference)
 	case ours != nil && reference == nil && !errors.Is(ours, cbor.ErrUnsupported) && !errors.Is(ours, cbor.ErrLimit):
@@ -70,6 +79,15 @@ func compare(t *testing.T, data []byte) {
 	want, err := diagnostic.Diagnose(data)
 	if err != nil {
 		t.Fatalf("%x: Diagnose: %v", data, err)
+	}
+	notation, err := cbor.Diagnose(data)
+	switch {
+	case err != nil:
+		t.Fatalf("%x: accepted by Unmarshal, rejected by Diagnose: %v", data, err)
+	case notation != want && !strings.Contains(want, `\u`) && !bignumTag.MatchString(notation):
+		// The reference escapes non-ASCII text and interprets bignum
+		// tags; otherwise the notations agree.
+		t.Fatalf("%x: Diagnose = %s, reference %s", data, notation, want)
 	}
 	var decoded any
 	if err := cbor.Unmarshal(data, &decoded); errors.Is(err, cbor.ErrType) {
@@ -91,6 +109,9 @@ func compare(t *testing.T, data []byte) {
 		}
 	}
 }
+
+// bignumTag matches tags 2 and 3 around a byte string in diagnostic notation.
+var bignumTag = regexp.MustCompile(`(^|[^0-9])[23]\(h'`)
 
 func tagSemantics(err error) bool {
 	message := err.Error()
@@ -171,7 +192,39 @@ func TestDifferentialVectors(t *testing.T) {
 	}
 }
 
+// TestDifferentialCOSE runs the cose-wg/Examples corpus through compare.
+func TestDifferentialCOSE(t *testing.T) {
+	for _, data := range coseCorpus(t) {
+		compare(t, data)
+	}
+}
+
+// coseCorpus reads the main module's copy of cose-wg/Examples.
+func coseCorpus(t testing.TB) [][]byte {
+	t.Helper()
+	text, err := os.ReadFile("../testdata/cose-wg/vectors.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus [][]byte
+	for line := range strings.Lines(string(text)) {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		data, err := hex.DecodeString(fields[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		corpus = append(corpus, data)
+	}
+	return corpus
+}
+
 func FuzzDifferential(f *testing.F) {
+	for _, data := range coseCorpus(f) {
+		f.Add(data)
+	}
 	for _, vectors := range [][]string{appendixA, extra} {
 		for _, encoded := range vectors {
 			data, _ := hex.DecodeString(encoded)

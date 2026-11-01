@@ -131,7 +131,6 @@ func TestErrorKindsAndOffsets(t *testing.T) {
 		{"9f01ff", cbor.ErrUnsupported, 0},
 		{"a1820102f5", cbor.ErrUnsupported, 1},
 		{"a1f97e00f5", cbor.ErrUnsupported, 1},
-		{"3bffffffffffffffff", cbor.ErrUnsupported, 0},
 		{"a301020304010f", cbor.ErrInvalid, 5},
 		{"82616162c328", cbor.ErrInvalid, 4},
 	} {

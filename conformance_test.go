@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"math/big"
 	"reflect"
 	"testing"
 
@@ -39,7 +40,7 @@ var appendixA = []struct {
 	{"1b000000e8d4a51000", uint64(1000000000000), nil, true},
 	{"1bffffffffffffffff", uint64(18446744073709551615), nil, true},
 	{"c249010000000000000000", cbor.TaggedValue{Number: 2, Value: []byte{1, 0, 0, 0, 0, 0, 0, 0, 0}}, nil, true},
-	{"3bffffffffffffffff", nil, cbor.ErrUnsupported, true},
+	{"3bffffffffffffffff", new(big.Int).Lsh(big.NewInt(-1), 64), nil, true},
 	{"c349010000000000000000", cbor.TaggedValue{Number: 3, Value: []byte{1, 0, 0, 0, 0, 0, 0, 0, 0}}, nil, true},
 	{"20", int64(-1), nil, true},
 	{"29", int64(-10), nil, true},
@@ -193,6 +194,9 @@ func sameValue(got, want any) bool {
 	case cbor.TaggedValue:
 		got, ok := got.(cbor.TaggedValue)
 		return ok && got.Number == want.Number && sameValue(got.Value, want.Value)
+	case *big.Int:
+		got, ok := got.(*big.Int)
+		return ok && got.Cmp(want) == 0
 	}
 	return reflect.DeepEqual(got, want)
 }
