@@ -3,7 +3,7 @@ module github.com/picatz/cbor/interop
 go 1.26
 
 require (
-	github.com/fxamacker/cbor/v2 v2.9.6
+	github.com/fxamacker/cbor/v2 v2.10.0
 	github.com/picatz/cbor v0.0.0
 )
 

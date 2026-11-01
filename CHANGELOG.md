@@ -49,6 +49,8 @@ Changes since `f5df8ee`, the last revision before
 - Decoding and encoding are rebuilt on a pooled parse arena and per-type
   compiled codecs: about 40% less time, 69% fewer bytes and 46% fewer
   allocations across the package benchmarks.
+- Duplicate map keys are found through per-map key fingerprints on the
+  stack, so a full comparison runs only for keys that may be equal.
 - The densest adversarial input, one-byte items, allocates about 50 bytes
   per input byte instead of about 182: arena items take 24 bytes, and the
   arena doubles, bounded by what the remaining input could hold.
@@ -77,8 +79,8 @@ variable nor a setter of unexported fields has one.
   runs for ten minutes nightly.
 - Actions are pinned to commit SHAs and updated by Dependabot, and
   `govulncheck` runs on both modules.
-- Side-by-side benchmarks against fxamacker/cbor live in the `interop`
-  module.
+- Side-by-side benchmarks against fxamacker/cbor (now v2.10.0) live in the
+  `interop` module.
 
 ### Design notes toward v1
 
