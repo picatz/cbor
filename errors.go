@@ -68,7 +68,7 @@ func (err *Error) Error() string {
 // Unwrap returns Kind so errors.Is can match the error kind.
 func (err *Error) Unwrap() error { return err.Kind }
 
-func newError(kind error, offset int, msg string) *Error {
+func newError[Offset ~int | ~uint32](kind error, offset Offset, msg string) *Error {
 	return &Error{Kind: kind, Offset: int64(offset), Msg: msg}
 }
 

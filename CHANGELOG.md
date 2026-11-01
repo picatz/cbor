@@ -21,6 +21,15 @@ These were deprecated for one revision and cannot be migrated by `go fix`:
 neither a mutable variable nor a setter of unexported fields has a
 single-expression replacement for its inliner.
 
+### Changed
+
+- Decoding allocates at most about 50 bytes per input byte for the densest
+  adversarial input (one-byte items), down from about 214 (and 182 before
+  the codec rebuild): parse-arena items shrink from 40 to 24 bytes, and the
+  arena doubles instead of growing by append's 1.25 factor, bounded by what
+  the remaining input could hold.
+- `MaxEncodedBytes` above `math.MaxInt32` is an invalid option.
+
 ## Previous revision
 
 ### Added

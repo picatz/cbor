@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"iter"
+	"math"
 	"reflect"
 )
 
@@ -62,7 +63,8 @@ type DecoderOptions struct {
 	MaxNestedLevels int
 
 	// MaxEncodedBytes limits the encoded size of one item. The default is
-	// DefaultMaxEncodedBytes.
+	// DefaultMaxEncodedBytes and the maximum is math.MaxInt32. Decoding
+	// indexes at most 24 bytes of memory per encoded byte.
 	MaxEncodedBytes int
 
 	// RejectTags fails decoding with ErrUnsupported at any tag.
@@ -122,7 +124,7 @@ func (options DecoderOptions) normalized() (DecoderOptions, error) {
 			*limit = DefaultMaxValue
 		}
 	}
-	if options.MaxNestedLevels < 0 || options.MaxNestedLevels > MaxNestedLevelsLimit || options.MaxEncodedBytes < 0 {
+	if options.MaxNestedLevels < 0 || options.MaxNestedLevels > MaxNestedLevelsLimit || options.MaxEncodedBytes < 0 || options.MaxEncodedBytes > math.MaxInt32 {
 		return options, errors.New("cbor: invalid decoder limit")
 	}
 	if options.MaxNestedLevels == 0 {

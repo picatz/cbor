@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/picatz/cbor"
@@ -40,33 +41,37 @@ type holdsTagPointer struct {
 }
 
 // TestEmbeddedTagPointer checks that a nil embedded *Tag neither panics nor
-// leaves a half-built codec in the type cache.
+// leaves a half-built codec in the type cache. The decoding runs in a
+// synctest bubble, where time is virtual: a hang fails immediately instead
+// of after a real timeout.
 func TestEmbeddedTagPointer(t *testing.T) {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for range 2 {
-			var value embedsTagPointer
-			if err := cbor.Unmarshal([]byte{0xc1, 0x05}, &value); err != nil || value.Tag == nil || value.Number != 1 || value.Content != 5 {
-				t.Errorf("Unmarshal = %+v, %v", value.Tag, err)
+	synctest.Test(t, func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for range 2 {
+				var value embedsTagPointer
+				if err := cbor.Unmarshal([]byte{0xc1, 0x05}, &value); err != nil || value.Tag == nil || value.Number != 1 || value.Content != 5 {
+					t.Errorf("Unmarshal = %+v, %v", value.Tag, err)
+				}
+				var holder holdsTagPointer
+				if err := cbor.Unmarshal([]byte{0xa1, 0x61, 'A', 0x01}, &holder); err != nil || holder.A != 1 {
+					t.Errorf("Unmarshal holder = %+v, %v", holder, err)
+				}
+				if encoded, err := cbor.Marshal(embedsTagPointer{}); err != nil || len(encoded) != 1 || encoded[0] != 0xf6 {
+					t.Errorf("Marshal nil embedded tag = %x, %v", encoded, err)
+				}
+				if encoded, err := cbor.Marshal(embedsTagPointer{&cbor.Tag[int]{Number: 1, Content: 5}}); err != nil || string(encoded) != "\xc1\x05" {
+					t.Errorf("Marshal embedded tag = %x, %v", encoded, err)
+				}
 			}
-			var holder holdsTagPointer
-			if err := cbor.Unmarshal([]byte{0xa1, 0x61, 'A', 0x01}, &holder); err != nil || holder.A != 1 {
-				t.Errorf("Unmarshal holder = %+v, %v", holder, err)
-			}
-			if encoded, err := cbor.Marshal(embedsTagPointer{}); err != nil || len(encoded) != 1 || encoded[0] != 0xf6 {
-				t.Errorf("Marshal nil embedded tag = %x, %v", encoded, err)
-			}
-			if encoded, err := cbor.Marshal(embedsTagPointer{&cbor.Tag[int]{Number: 1, Content: 5}}); err != nil || string(encoded) != "\xc1\x05" {
-				t.Errorf("Marshal embedded tag = %x, %v", encoded, err)
-			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Minute):
+			t.Fatal("decoding hung")
 		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("decoding hung")
-	}
+	})
 }
 
 type isZeroer interface{ IsZero() bool }

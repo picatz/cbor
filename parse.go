@@ -15,13 +15,16 @@ import (
 // directly, and next is the arena index just past its subtree. Siblings are
 // therefore reached without recursion, and skipping an unknown struct field
 // costs O(1) regardless of its size.
+//
+// Offsets are uint32, which keeps an item at 24 bytes; MaxEncodedBytes is
+// capped at math.MaxInt32, and an arena never holds more items than bytes.
 type item struct {
-	major    byte
-	minor    byte   // additional information
 	argument uint64 // integer value, length, count, tag number, simple value or float bits
-	start    int    // offset of the item's initial byte
-	end      int    // offset just past the item
-	next     int    // arena index of the next sibling
+	start    uint32 // offset of the item's initial byte
+	end      uint32 // offset just past the item
+	next     uint32 // arena index of the next sibling
+	major    byte
+	minor    byte // additional information
 }
 
 func (value *item) isFloat() bool {
@@ -41,7 +44,7 @@ func (value *item) float() float64 {
 func (value *item) isNull() bool { return value.major == 7 && value.minor == 22 }
 
 // payload is the offset of a string's content.
-func (value *item) payload() int { return value.end - int(value.argument) }
+func (value *item) payload() int { return int(value.end) - int(value.argument) }
 
 // parser reads one item from input or, when reader is set, from a stream
 // without read-ahead. data holds every byte of the current item consumed so
@@ -104,6 +107,18 @@ func (parser *parser) readSlow(start, count int) ([]byte, error) {
 	return parser.data[start:], nil
 }
 
+// grow doubles the arena, rather than using append's gentler growth for
+// large slices, so the copies made while growing total at most the final
+// size. In slice mode, every item needs at least one byte, so the arena never
+// grows past the items the remaining input could hold.
+func (parser *parser) grow() {
+	size := max(2*cap(parser.items), 64)
+	if parser.reader == nil {
+		size = min(size, len(parser.items)+len(parser.input)-len(parser.data)+1)
+	}
+	parser.items = append(make([]item, 0, size), parser.items...)
+}
+
 // header reads an initial byte and its argument.
 func (parser *parser) header(result *item) error {
 	start := len(parser.data)
@@ -119,7 +134,7 @@ func (parser *parser) header(result *item) error {
 		}
 		initial = encoded[0]
 	}
-	result.start = start
+	result.start = uint32(start)
 	result.major = initial >> 5
 	result.minor = initial & 31
 	result.argument = uint64(result.minor)
@@ -155,7 +170,11 @@ func (parser *parser) parse(depth int) (int, error) {
 		return 0, newError(ErrLimit, len(parser.data), "nesting limit exceeded")
 	}
 	index := len(parser.items)
-	parser.items = append(parser.items, item{})
+	if index == cap(parser.items) {
+		parser.grow()
+	}
+	parser.items = parser.items[:index+1]
+	parser.items[index] = item{}
 	if err := parser.header(&parser.items[index]); err != nil {
 		return 0, err
 	}
@@ -200,8 +219,8 @@ func (parser *parser) parse(depth int) (int, error) {
 			}
 		}
 	}
-	result.end = len(parser.data)
-	result.next = len(parser.items)
+	result.end = uint32(len(parser.data))
+	result.next = uint32(len(parser.items))
 	return index, nil
 }
 
@@ -296,7 +315,7 @@ func (keys *keySet) add(data []byte, items []item, index int) error {
 			if sameKey(data, &items[position], key) {
 				return newError(ErrInvalid, key.start, "duplicate map key")
 			}
-			position = items[items[position].next].next
+			position = int(items[items[position].next].next)
 		}
 		keys.count++
 		return nil
@@ -305,7 +324,7 @@ func (keys *keySet) add(data []byte, items []item, index int) error {
 		keys.ids = make(map[keyID]struct{}, 2*linearKeyScan)
 		for position, seen := keys.first, 0; seen < keys.count; seen++ {
 			keys.ids[identify(data, &items[position])] = struct{}{}
-			position = items[items[position].next].next
+			position = int(items[items[position].next].next)
 		}
 	}
 	id := identify(data, key)
