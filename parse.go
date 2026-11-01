@@ -173,12 +173,13 @@ func (parser *parser) parse(depth int) (int, error) {
 	if index == cap(parser.items) {
 		parser.grow()
 	}
+	// header assigns start, major, minor and argument, and end and next are
+	// assigned below, so the reused slot needs no zeroing.
 	parser.items = parser.items[:index+1]
-	parser.items[index] = item{}
-	if err := parser.header(&parser.items[index]); err != nil {
+	result := &parser.items[index]
+	if err := parser.header(result); err != nil {
 		return 0, err
 	}
-	result := &parser.items[index]
 	switch result.major {
 	case 2, 3:
 		limit := parser.options.MaxBytes
@@ -262,7 +263,7 @@ func (parser *parser) container(index, depth int) error {
 		}
 		return nil
 	}
-	keys := keySet{first: index + 1}
+	var keys keySet
 	previous := -1
 	for range result.argument {
 		key, err := parser.parse(depth + 1)
@@ -294,16 +295,39 @@ type keyID struct {
 	text     string
 }
 
-// keySet detects duplicate map keys. Small maps are checked by a linear scan
-// over the keys already in the arena, without allocating; larger maps switch
-// to a hash set.
+// keySet detects duplicate map keys. Small maps keep a fingerprint and arena
+// index per key on the stack and compare keys in full only when
+// fingerprints match; larger maps switch to a hash set.
 type keySet struct {
-	first int // arena index of the map's first key
-	count int // keys added so far
-	ids   map[keyID]struct{}
+	count     int // keys added so far
+	ids       map[keyID]struct{}
+	prints    [linearKeyScan]uint64
+	positions [linearKeyScan]uint32
 }
 
 const linearKeyScan = 16
+
+// fingerprint is equal for keys that are equal in the CBOR data model, so
+// unequal fingerprints prove keys distinct. Integers and simple values use
+// their major type and argument, strings also their first bytes, and floats
+// their value with -0 folded into +0.
+func fingerprint(data []byte, key *item) uint64 {
+	switch {
+	case key.major == 2 || key.major == 3:
+		print := uint64(key.major)<<61 ^ key.argument
+		for _, octet := range data[key.payload():min(key.payload()+8, int(key.end))] {
+			print = print<<8 ^ print>>56 ^ uint64(octet)
+		}
+		return print
+	case key.isFloat():
+		number := key.float()
+		if number == 0 {
+			number = 0
+		}
+		return math.Float64bits(number) ^ 0x9e3779b97f4a7c15 // distinguish from integer prints
+	}
+	return uint64(key.major)<<61 ^ key.argument
+}
 
 func (keys *keySet) add(data []byte, items []item, index int) error {
 	key := &items[index]
@@ -311,20 +335,20 @@ func (keys *keySet) add(data []byte, items []item, index int) error {
 		return err
 	}
 	if keys.count < linearKeyScan {
-		for position, seen := keys.first, 0; seen < keys.count; seen++ {
-			if sameKey(data, &items[position], key) {
+		print := fingerprint(data, key)
+		for position, previous := range keys.prints[:keys.count] {
+			if previous == print && sameKey(data, &items[keys.positions[position]], key) {
 				return newError(ErrInvalid, key.start, "duplicate map key")
 			}
-			position = int(items[items[position].next].next)
 		}
+		keys.prints[keys.count], keys.positions[keys.count] = print, uint32(index)
 		keys.count++
 		return nil
 	}
 	if keys.ids == nil {
 		keys.ids = make(map[keyID]struct{}, 2*linearKeyScan)
-		for position, seen := keys.first, 0; seen < keys.count; seen++ {
+		for _, position := range keys.positions {
 			keys.ids[identify(data, &items[position])] = struct{}{}
-			position = int(items[items[position].next].next)
 		}
 	}
 	id := identify(data, key)
