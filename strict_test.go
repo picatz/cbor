@@ -295,7 +295,7 @@ func TestDuplicateKeyFingerprints(t *testing.T) {
 		{"a2616101410102", true},                                      // "a" and h'61'
 		{"a2 69616263646566676869 01 6961626364656667686a 02", true},  // same length and first 8 bytes
 		{"a2 69616263646566676869 01 69616263646566676869 02", false}, // the same 9-byte key twice
-		{"a2 686162636465666768 01 69616263646566676869 02", true},      // a key and its extension
+		{"a2 686162636465666768 01 69616263646566676869 02", true},    // a key and its extension
 		{"a201021801 03", false},                                      // 1 and 0x1801
 		{"a2f93c0001fb3ff000000000000002", false},                     // 1.0 as binary16 and binary64
 		{"a2f9000001f9800002", false},                                 // +0.0 and -0.0
