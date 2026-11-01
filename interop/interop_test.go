@@ -62,6 +62,13 @@ func compare(t *testing.T, data []byte) {
 		// null and undefined are distinct simple values, but the reference
 		// decodes both to a Go nil and then reports them as duplicates.
 		return
+	case ours == nil && reference != nil && strings.Contains(reference.Error(), "invalid map key type: big.Int"):
+		// Neither library can hold a bignum key in map[any]any; the item
+		// itself is valid.
+		if err := cbor.Unmarshal(data, new(any)); !errors.Is(err, cbor.ErrType) {
+			t.Fatalf("%x: bignum map key into any: %v, want ErrType", data, err)
+		}
+		return
 	case ours == nil && reference != nil:
 		t.Fatalf("%x: accepted, reference rejected: %v", data, reference)
 	case ours != nil && reference == nil && !errors.Is(ours, cbor.ErrUnsupported) && !errors.Is(ours, cbor.ErrLimit):

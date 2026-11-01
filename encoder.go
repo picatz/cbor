@@ -115,7 +115,7 @@ func (options EncoderOptions) Marshal(value any) ([]byte, error) {
 	}
 	state := getEncodeState(options)
 	defer putEncodeState(state)
-	encoded, err := state.appendAny(state.buffer[:0], value, 0)
+	encoded, err := state.appendItem(state.buffer[:0], value)
 	if err != nil {
 		return nil, err
 	}
@@ -131,8 +131,7 @@ func (options EncoderOptions) AppendMarshal(dst []byte, value any) ([]byte, erro
 	}
 	state := getEncodeState(options)
 	defer putEncodeState(state)
-	state.base = len(dst)
-	encoded, err := state.appendAny(dst, value, 0)
+	encoded, err := state.appendItem(dst, value)
 	if err != nil {
 		return dst, err
 	}
@@ -150,7 +149,7 @@ func (encoder *Encoder) Encode(value any) error {
 	}
 	state := getEncodeState(encoder.options)
 	defer putEncodeState(state)
-	encoded, err := state.appendAny(state.buffer[:0], value, 0)
+	encoded, err := state.appendItem(state.buffer[:0], value)
 	if err != nil {
 		return err
 	}

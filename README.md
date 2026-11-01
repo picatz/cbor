@@ -175,8 +175,9 @@ reproduces every RFC 8949 Appendix A example verbatim: `{1: -7, 4: h'3131'}`,
   `big.Int`; other date, URI and similar tags are not interpreted. `RejectTags`
   disables tags altogether.
 - Generic maps use `map[any]any`. Composite and NaN map keys are unsupported.
-  Byte-string keys, and integer keys below `math.MinInt64`, can be kept with
-  `RawMessage` or typed maps, but not as `map[any]any` keys.
+  Byte-string keys can be kept with `RawMessage` or typed maps, but not as
+  `map[any]any` keys; integer keys below `math.MinInt64` cannot be keys of any
+  interface-keyed map, where a `*big.Int` would compare by pointer.
 - `[]byte` and byte arrays such as `[16]byte` encode as byte strings. Byte
   strings decode into `[]byte` and into byte arrays of exactly matching length.
 - Encoders cap items at 1 MiB, nesting at 64 levels, and arrays/maps at 10,000

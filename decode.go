@@ -64,10 +64,21 @@ func decoderFor(kind reflect.Type) decoderFunc {
 	if loaded {
 		return cached.(decoderFunc)
 	}
-	decoder = newDecoder(kind)
-	ready.Done()
-	decoderCache.Store(kind, decoder)
-	return decoder
+	defer func() {
+		if decoder == nil {
+			// Construction panicked: release any waiters with an error and
+			// drop the placeholder, so the cache is not left poisoned.
+			decoderCache.CompareAndDelete(kind, cached)
+			decoder = func(*decodeState, reflect.Value, int) error {
+				return encodeError(ErrUnsupported, "no decoder for "+kind.String())
+			}
+		}
+		ready.Done()
+	}()
+	built := newDecoder(kind)
+	decoder = built
+	decoderCache.Store(kind, built)
+	return built
 }
 
 var (
@@ -255,7 +266,7 @@ func decodeTaggedValue(state *decodeState, destination reflect.Value, index int)
 
 func decodeSimpleValue(state *decodeState, destination reflect.Value, index int) error {
 	value := &state.items[index]
-	if value.major != 7 || value.isFloat() {
+	if value.major != 7 || value.isFloat() || value.isNull() {
 		return state.typeError(value, destination.Type())
 	}
 	destination.SetInt(int64(value.argument))
@@ -263,15 +274,21 @@ func decodeSimpleValue(state *decodeState, destination reflect.Value, index int)
 }
 
 func newTagDecoder(kind reflect.Type) decoderFunc {
-	content := reflect.New(kind).Interface().(tagDecoder).cborTagTarget(0).Type()
-	decode := decoderFor(content)
+	number, content, ok := tagFields(kind)
+	if !ok {
+		return func(*decodeState, reflect.Value, int) error {
+			return encodeError(ErrUnsupported, "ambiguous or unexported embedded Tag in "+kind.String())
+		}
+	}
+	contentField := kind.FieldByIndex(content)
+	decode := decoderFor(contentField.Type)
 	return func(state *decodeState, destination reflect.Value, index int) error {
 		value := &state.items[index]
 		if value.major != 6 {
 			return state.typeError(value, destination.Type())
 		}
-		target := destination.Addr().Interface().(tagDecoder).cborTagTarget(value.argument)
-		return decode(state, target, index+1)
+		fieldForDecode(destination, number).SetUint(value.argument)
+		return decode(state, fieldForDecode(destination, content), index+1)
 	}
 }
 
@@ -438,6 +455,10 @@ func newMapDecoder(kind reflect.Type) decoderFunc {
 		key, element := reflect.New(keyType).Elem(), reflect.New(elementType).Elem()
 		child := index + 1
 		for range count {
+			if interfaceKey && state.items[child].major == 1 && state.items[child].argument > math.MaxInt64 {
+				// A *big.Int key would compare by pointer, not by value.
+				return newError(ErrType, state.items[child].start, "integer map key below math.MinInt64 cannot be an interface map key")
+			}
 			key.SetZero()
 			if err := decodeKey(state, key, child); err != nil {
 				return err

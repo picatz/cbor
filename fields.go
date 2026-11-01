@@ -187,10 +187,13 @@ func computeStruct(kind reflect.Type) (*structInfo, error) {
 					if top.toArray && field.Type.Kind() == reflect.Pointer {
 						return nil, structError(kind, "toarray structs cannot embed pointers, which may be nil")
 					}
-					nextCount[target]++
-					if nextCount[target] == 1 {
+					// A type reached through a parent embedded several times at
+					// this depth is reached that many times, so conflicts
+					// among its fields are detected however deep they are.
+					if nextCount[target] == 0 {
 						next = append(next, embedded{kind: target, index: index})
 					}
+					nextCount[target] += max(count[parent.kind], 1)
 					continue
 				}
 				metadata, err := newField(kind, options, field, name, list, index)
@@ -418,7 +421,7 @@ func (field *structField) omit(value reflect.Value) bool {
 		return false
 	}
 	if value.Type().Implements(isZeroerType) {
-		if value.Kind() == reflect.Pointer && value.IsNil() {
+		if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil() {
 			return true
 		}
 		return value.Interface().(interface{ IsZero() bool }).IsZero()

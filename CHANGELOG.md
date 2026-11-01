@@ -41,8 +41,8 @@ minor versions may change behavior; such changes are listed under
 - Negative integers below `math.MinInt64` are accepted instead of failing with
   `ErrUnsupported`. They decode into `big.Int`, `*big.Int` or `RawMessage`, and
   into `any` as `*big.Int`; into `int64` they fail with `ErrType`. As keys of
-  `map[any]any` they fail with `ErrType`, like byte-string keys, because a
-  `*big.Int` key would compare by pointer.
+  maps with interface-typed keys, such as `map[any]any`, they fail with
+  `ErrType`, because a `*big.Int` key would compare by pointer.
 - Type error messages name the item and destination, such as `cannot decode
   text string into int` or `negative integer overflows uint8`.
 - Decoding and encoding are rebuilt on a pooled parse arena and per-type

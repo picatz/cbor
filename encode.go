@@ -109,10 +109,21 @@ func encoderFor(kind reflect.Type) encoderFunc {
 	if loaded {
 		return cached.(encoderFunc)
 	}
-	encoder = newEncoder(kind)
-	ready.Done()
-	encoderCache.Store(kind, encoder)
-	return encoder
+	defer func() {
+		if encoder == nil {
+			// Construction panicked: release any waiters with an error and
+			// drop the placeholder, so the cache is not left poisoned.
+			encoderCache.CompareAndDelete(kind, cached)
+			encoder = func(*encodeState, []byte, reflect.Value, int) ([]byte, error) {
+				return nil, encodeError(ErrUnsupported, "no encoder for "+kind.String())
+			}
+		}
+		ready.Done()
+	}()
+	built := newEncoder(kind)
+	encoder = built
+	encoderCache.Store(kind, built)
+	return built
 }
 
 var marshalerType = reflect.TypeFor[Marshaler]()
@@ -258,6 +269,20 @@ func (state *encodeState) appendRaw(output, encoded []byte, depth int) ([]byte, 
 		return nil, err
 	}
 	return append(output, encoded...), nil
+}
+
+// appendItem appends one complete item to output. Limits are checked before
+// each nested value, so the last headers and scalars are checked here.
+func (state *encodeState) appendItem(output []byte, value any) ([]byte, error) {
+	state.base = len(output)
+	encoded, err := state.appendAny(output, value, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded)-state.base > maxEncodedItem {
+		return nil, errSizeLimit
+	}
+	return encoded, nil
 }
 
 // appendAny encodes a dynamic value. The types that decoding into any
@@ -406,17 +431,21 @@ func encodeBigInt(_ *encodeState, output []byte, value reflect.Value, _ int) ([]
 }
 
 func newTagEncoder(kind reflect.Type) encoderFunc {
-	if !isTagType(kind) {
-		// A struct embedding a Tag is encoded through the promoted method.
-		return func(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
-			number, content := value.Interface().(tagEncoder).cborTag()
-			return state.child(encoderFor(content.Type()), appendHeader(output, 6, number), content, depth+1)
+	number, content, ok := tagFields(kind)
+	if !ok {
+		return func(*encodeState, []byte, reflect.Value, int) ([]byte, error) {
+			return nil, encodeError(ErrUnsupported, "ambiguous or unexported embedded Tag in "+kind.String())
 		}
 	}
-	content := encoderFor(kind.Field(1).Type)
+	contentField := kind.FieldByIndex(content)
+	encode := encoderFor(contentField.Type)
 	return func(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
-		output = appendHeader(output, 6, value.Field(0).Uint())
-		return state.child(content, output, value.Field(1), depth+1)
+		tagNumber, ok := fieldByIndex(value, number)
+		if !ok {
+			return append(output, 0xf6), nil // a nil embedded *Tag
+		}
+		field, _ := fieldByIndex(value, content)
+		return state.child(encode, appendHeader(output, 6, tagNumber.Uint()), field, depth+1)
 	}
 }
 
