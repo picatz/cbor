@@ -591,7 +591,9 @@ func newMapDecoder(kind reflect.Type) decoderFunc {
 	// Entries whose key or element awaits an UnmarshalCBOR call are decoded
 	// into fresh values and inserted by flush, after that call has run.
 	deferInsert := deferred(keyType) || deferred(elementType)
-	trackKeys := !valueKeys(keyType)
+	// Deferred insertions cannot detect duplicates until flush, after
+	// application code has run, so those maps track keys during the pass.
+	trackKeys := deferInsert || !valueKeys(keyType)
 	return func(state *decodeState, destination reflect.Value, value item, depth int) error {
 		if value.isNull() {
 			return nil
