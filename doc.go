@@ -15,7 +15,8 @@
 // well-formed fail with ErrMalformed and invalid items, such as maps with
 // duplicate keys (compared in the CBOR data model, so 1 and 0x1801 collide)
 // or text with invalid UTF-8, fail with ErrInvalid. The whole item is
-// validated before any of it is decoded. Tags are preserved as TaggedValue or
+// validated before any UnmarshalCBOR method is called or the destination
+// is replaced. Tags are preserved as TaggedValue or
 // Tag without interpreting their content, except that bignums (tags 2 and 3)
 // decode into big.Int; simple values other than false, true, null and the
 // floats decode as SimpleValue.

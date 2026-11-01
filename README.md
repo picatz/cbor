@@ -87,9 +87,10 @@ offset, classified for `errors.Is`:
 
 Duplicate keys are detected in the CBOR data model, so `1` and `0x1801`, or
 `1.0` as binary16 and binary64, collide. The whole item is validated before
-any value is decoded. A destination is replaced on success and unchanged on
-error, apart from side effects inside application-provided `UnmarshalCBOR`
-methods.
+anything observable happens: application-provided `UnmarshalCBOR` methods run
+only once the item, and the absence of trailing data, has been validated. A
+destination is replaced on success and unchanged on error, apart from side
+effects inside those methods.
 
 Decoded byte slices, strings and `RawMessage` values never alias the input.
 `RawMessage` copies the complete original encoding for delayed decoding.
@@ -189,12 +190,14 @@ The module requires Go 1.26 and has no dependencies.
 
 ## Performance
 
-Decoding validates the whole item into a pooled, flat arena, then decodes
-with per-type decoders compiled once and cached; unknown fields are skipped
-in constant time. Encoding uses per-type encoders, struct keys pre-sorted for
-each order, and pooled scratch buffers for map entries. The only steady-state
-allocations are the decoded strings and byte slices, which never alias the
-input, and the returned encoding.
+Decoding validates and decodes in one pass with per-type decoders compiled
+once and cached, and builds no index of the input; calls into `UnmarshalCBOR`
+methods are queued and run once the whole item is valid, so a failure is
+still invisible. Unknown fields, raw messages and custom-unmarshaled items are
+checked by a validating scan. Encoding uses per-type encoders, struct keys
+pre-sorted for each order, and pooled scratch buffers for map entries. The
+only steady-state allocations are the decoded strings and byte slices, which
+never alias the input, and the returned encoding.
 
 Side by side with fxamacker/cbor v2.10.0 (strict duplicate-key and UTF-8
 checks, core deterministic encoding), as benchstat medians of ten runs on a
@@ -203,16 +206,16 @@ significant.
 
 | Benchmark | picatz/cbor | fxamacker/cbor | Time |
 |-----------|-------------|----------------|------|
-| Decode RFC 8392 CWT claims into a struct | 772 ns, 5 allocs | 613 ns, 5 allocs | +26% |
-| Decode an RFC 9052 EC2 COSE_Key | 625 ns, 4 allocs | 494 ns, 4 allocs | +27% |
-| Decode a CTAP2 `getInfo` response into `any` | 3.57 µs, 52 allocs | 3.21 µs, 52 allocs | +11% |
+| Decode RFC 8392 CWT claims into a struct | 589 ns, 5 allocs | 554 ns, 5 allocs | +6% |
+| Decode an RFC 9052 EC2 COSE_Key | 452 ns, 4 allocs | 492 ns, 4 allocs | -8% |
+| Decode a CTAP2 `getInfo` response into `any` | 2.89 µs, 52 allocs | 3.13 µs, 52 allocs | -8% |
 | Encode CWT claims | 236 ns, 1 alloc | 213 ns, 1 alloc | +11% |
 | Encode a COSE_Key | 272 ns, 1 alloc | 201 ns, 1 alloc | +36% |
 | Encode the `getInfo` response from `any` | 1.59 µs, 3 allocs | 1.57 µs, 1 alloc | ~ |
 | Encode a `map[string]bool` | 626 ns, 3 allocs | 510 ns, 1 alloc | +23% |
 
-The remaining gap is mostly reflection's per-field cost and the separate
-validation pass that lets a failed decode leave its destination unchanged.
+What remains of the decoding gap is reflection's per-field cost and the zero
+check that lets a failed decode leave its destination unchanged.
 Against fxamacker/cbor v2.9.6, the previous release, this package was faster
 on seven of these eight benchmarks.
 

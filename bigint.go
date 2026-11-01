@@ -19,8 +19,7 @@ func negativeBig(argument uint64) *big.Int {
 	return value.Not(value) // -1 - argument
 }
 
-func decodeBigInt(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeBigInt(state *decodeState, destination reflect.Value, value item, depth int) error {
 	result := destination.Addr().Interface().(*big.Int)
 	switch value.major {
 	case 0:
@@ -31,11 +30,17 @@ func decodeBigInt(state *decodeState, destination reflect.Value, index int) erro
 		result.Not(result)
 		return nil
 	case 6:
-		content := &state.items[index+1]
-		if (value.argument != TagUnsignedBignum && value.argument != TagNegativeBignum) || content.major != 2 {
+		if value.argument != TagUnsignedBignum && value.argument != TagNegativeBignum {
 			break
 		}
-		magnitude := state.payload(content)
+		var content item
+		if err := state.item(&content, depth+1); err != nil {
+			return err
+		}
+		if content.major != 2 {
+			break
+		}
+		magnitude := state.payload(&content)
 		if state.deterministic && (len(magnitude) <= 8 || magnitude[0] == 0) {
 			return newError(ErrNotDeterministic, value.start, "bignum not in preferred serialization")
 		}
@@ -45,7 +50,7 @@ func decodeBigInt(state *decodeState, destination reflect.Value, index int) erro
 		}
 		return nil
 	}
-	return state.typeError(value, destination.Type())
+	return state.typeError(&value, destination.Type())
 }
 
 // appendBigInt encodes a bignum in preferred serialization.

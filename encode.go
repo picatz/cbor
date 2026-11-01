@@ -747,20 +747,19 @@ func (state *encodeState) endMap(output []byte, depth int, entries mapEntries, c
 func checkEncodedKeys(buffer []byte, spans []span) error {
 	var seen map[keyID]struct{}
 	for _, entry := range spans {
-		var arena [1]item
-		parser := parser{input: buffer[entry.start:entry.key], options: rawOptions, items: arena[:0]}
-		index, err := parser.parse(0)
-		if err != nil {
+		parser := parser{options: &rawOptions}
+		parser.setInput(buffer[entry.start:entry.key])
+		var key item
+		if err := parser.skip(&key, 0); err != nil {
 			return err
 		}
-		key := &parser.items[index]
-		if err := checkKeyType(key); err != nil {
+		if err := checkKeyType(&key); err != nil {
 			return err
 		}
 		if seen == nil {
 			seen = make(map[keyID]struct{}, len(spans))
 		}
-		id := identify(parser.data, key)
+		id := identify(parser.data, &key)
 		if _, ok := seen[id]; ok {
 			return encodeError(ErrInvalid, "duplicate encoded map key")
 		}

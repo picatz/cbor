@@ -2,27 +2,23 @@ package cbor
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"math"
-	"sync"
 	"unicode/utf8"
 )
 
-// item is one well-formed, valid data item recorded by the parser. Scalars
-// stay in their encoded form so parsing allocates nothing per value.
+// item is the header of one data item, read and validated by parser.item.
+// Scalars stay in their encoded form so reading allocates nothing per value.
 //
-// Items live in a flat arena in pre-order: a container's children follow it
-// directly, and next is the arena index just past its subtree. Siblings are
-// therefore reached without recursion, and skipping an unknown struct field
-// costs O(1) regardless of its size.
-//
-// Offsets are uint32, which keeps an item at 24 bytes; MaxEncodedBytes is
-// capped at math.MaxInt32, and an arena never holds more items than bytes.
+// For integers, strings, simple values and floats, end is the offset just
+// past the item. For arrays, maps and tags, skipRest assigns it once the
+// children have been consumed; a decoder that reads the children itself
+// does not need it.
 type item struct {
 	argument uint64 // integer value, length, count, tag number, simple value or float bits
-	start    uint32 // offset of the item's initial byte
-	end      uint32 // offset just past the item
-	next     uint32 // arena index of the next sibling
+	start    int    // offset of the item's initial byte
+	end      int    // offset just past the item, once known
 	major    byte
 	minor    byte // additional information
 }
@@ -44,39 +40,42 @@ func (value *item) float() float64 {
 func (value *item) isNull() bool { return value.major == 7 && value.minor == 22 }
 
 // payload is the offset of a string's content.
-func (value *item) payload() int { return int(value.end) - int(value.argument) }
+func (value *item) payload() int { return value.end - int(value.argument) }
 
-// parser reads one item from input or, when reader is set, from a stream
-// without read-ahead. data holds every byte of the current item consumed so
-// far; in slice mode it is a prefix of input and is never copied.
+// parser reads items from a slice or, when reader is set, from a stream
+// without read-ahead. data holds the bytes available, of which the first
+// pos have been consumed: in slice mode it is the input itself and is never
+// copied, and in stream mode it grows by appending as items are read, so
+// pos is its length.
+//
+// Decoding is a single pass: each item is validated as it is read, and
+// everything observable, such as calls into application code, waits until
+// the whole item has been validated. Slices of data must not be retained
+// across reads, since in stream mode appending may move it; offsets are
+// stable.
 type parser struct {
 	reader  io.Reader
-	input   []byte
-	options DecoderOptions
+	options *DecoderOptions // normalized, and never modified
 	data    []byte
-	items   []item
+	pos     int
+
+	// limit is the offset up to which data can be read without checks, in
+	// slice mode: the end of the input or of the encoded size budget. It
+	// is zero in stream mode, where pos is already the end of data.
+	limit int
 }
 
-// maxPooledItems bounds the arena kept for reuse, so one large item does not
-// pin memory for the life of the process.
-const maxPooledItems = 4096
-
-var arenaPool = sync.Pool{New: func() any { return new([]item) }}
-
-func getArena() *[]item { return arenaPool.Get().(*[]item) }
-
-func putArena(arena *[]item, items []item) {
-	if cap(items) <= maxPooledItems {
-		*arena = items[:0]
-		arenaPool.Put(arena)
-	}
+// setInput prepares the parser to read one item from data.
+func (parser *parser) setInput(data []byte) {
+	parser.data, parser.pos = data, 0
+	parser.limit = min(len(data), parser.options.MaxEncodedBytes)
 }
 
 func (parser *parser) read(count int) ([]byte, error) {
-	start := len(parser.data)
-	if parser.reader == nil && uint(count) <= uint(len(parser.input)-start) && count <= parser.options.MaxEncodedBytes-start {
-		parser.data = parser.input[:start+count]
-		return parser.data[start:], nil
+	start := parser.pos
+	if parser.reader == nil && uint(count) <= uint(len(parser.data)-start) && count <= parser.options.MaxEncodedBytes-start {
+		parser.pos = start + count
+		return parser.data[start:parser.pos], nil
 	}
 	return parser.readSlow(start, count)
 }
@@ -86,47 +85,61 @@ func (parser *parser) readSlow(start, count int) ([]byte, error) {
 		return nil, newError(ErrLimit, start, "encoded size limit exceeded")
 	}
 	if parser.reader == nil {
-		if count > len(parser.input)-start {
-			if start == 0 && len(parser.input) == 0 {
+		if count > len(parser.data)-start {
+			if start == 0 && len(parser.data) == 0 {
 				return nil, io.EOF
 			}
 			return nil, io.ErrUnexpectedEOF
 		}
-		parser.data = parser.input[:start+count]
-		return parser.data[start:], nil
+		parser.pos = start + count
+		return parser.data[start:parser.pos], nil
 	}
 	parser.data = append(parser.data, make([]byte, count)...)
 	read, err := io.ReadFull(parser.reader, parser.data[start:])
 	if err != nil {
 		parser.data = parser.data[:start+read]
+		parser.pos = len(parser.data)
 		if err == io.EOF && start > 0 {
 			err = io.ErrUnexpectedEOF
 		}
 		return nil, err
 	}
+	parser.pos = len(parser.data)
 	return parser.data[start:], nil
 }
 
-// grow doubles the arena, rather than using append's gentler growth for
-// large slices, so the copies made while growing total at most the final
-// size. In slice mode, every item needs at least one byte, so the arena never
-// grows past the items the remaining input could hold.
-func (parser *parser) grow() {
-	size := max(2*cap(parser.items), 64)
-	if parser.reader == nil {
-		size = min(size, len(parser.items)+len(parser.input)-len(parser.data)+1)
+// item reads and validates one item's header at nesting depth, and the
+// content of a string. Every limit is checked here, before the caller
+// allocates for the item or descends into its children. The children of an
+// array, map or tag are left for the caller to read, with skipRest or one
+// item at a time.
+//
+// One-byte items (integers below 24, false, true, null and undefined), the
+// usual map keys of COSE and CWT, are read inline; they need no check
+// beyond the nesting limit.
+func (parser *parser) item(result *item, depth int) error {
+	start := parser.pos
+	if start < parser.limit && depth <= parser.options.MaxNestedLevels {
+		if initial := parser.data[start]; initial&31 < 24 && (initial < 0x40 || initial >= 0xf4) {
+			*result = item{argument: uint64(initial & 31), start: start, end: start + 1, major: initial >> 5, minor: initial & 31}
+			parser.pos = start + 1
+			return nil
+		}
 	}
-	parser.items = append(make([]item, 0, size), parser.items...)
+	return parser.itemSlow(result, depth)
 }
 
-// header reads an initial byte and its argument.
-func (parser *parser) header(result *item) error {
-	start := len(parser.data)
+// itemSlow is item for every other input.
+func (parser *parser) itemSlow(result *item, depth int) error {
+	start := parser.pos
+	if depth > parser.options.MaxNestedLevels {
+		return newError(ErrLimit, start, "nesting limit exceeded")
+	}
 	var initial byte
-	if parser.reader == nil && start < len(parser.input) && start < parser.options.MaxEncodedBytes {
-		// Fast path for slices: no bounds bookkeeping beyond the checks above.
-		initial = parser.input[start]
-		parser.data = parser.input[:start+1]
+	if start < parser.limit {
+		// Fast path for slices: no bounds bookkeeping beyond the check above.
+		initial = parser.data[start]
+		parser.pos = start + 1
 	} else {
 		encoded, err := parser.read(1)
 		if err != nil {
@@ -134,20 +147,108 @@ func (parser *parser) header(result *item) error {
 		}
 		initial = encoded[0]
 	}
-	result.start = uint32(start)
+	result.start = start
 	result.major = initial >> 5
 	result.minor = initial & 31
 	result.argument = uint64(result.minor)
+	if result.minor >= 24 {
+		width := 1 << (result.minor - 24) // 16 and 32 for the reserved values
+		if result.minor < 28 && width <= parser.limit-start-1 {
+			// Fast path for slices, with the same checks as read.
+			encoded := parser.data[start+1 : start+1+width]
+			parser.pos = start + 1 + width
+			switch width {
+			case 1:
+				result.argument = uint64(encoded[0])
+			case 2:
+				result.argument = uint64(binary.BigEndian.Uint16(encoded))
+			case 4:
+				result.argument = uint64(binary.BigEndian.Uint32(encoded))
+			default:
+				result.argument = binary.BigEndian.Uint64(encoded)
+			}
+			if result.major != 7 && parser.options.RejectNonMinimal && !minimal(result.argument, width) {
+				return newError(ErrNotDeterministic, start, "non-minimal argument")
+			}
+		} else if err := parser.argument(result); err != nil {
+			return err
+		}
+	}
+	switch result.major {
+	case 2, 3:
+		limit := parser.options.MaxBytes
+		if result.major == 3 {
+			limit = parser.options.MaxStringBytes
+		}
+		if result.argument > uint64(limit) {
+			return newError(ErrLimit, result.start, "string size limit exceeded")
+		}
+		payload, length := parser.pos, int(result.argument)
+		var encoded []byte
+		if length <= parser.limit-payload {
+			encoded = parser.data[payload : payload+length]
+			parser.pos = payload + length
+		} else {
+			var err error
+			if encoded, err = parser.read(length); err != nil {
+				return err
+			}
+		}
+		if result.major == 3 && !utf8.Valid(encoded) {
+			return newError(ErrInvalid, payload, "invalid UTF-8")
+		}
+	case 4, 5:
+		limit := parser.options.MaxArrayElements
+		if result.major == 5 {
+			limit = parser.options.MaxMapPairs
+		}
+		if result.argument > uint64(limit) {
+			return newError(ErrLimit, result.start, "container size limit exceeded")
+		}
+		count := result.argument
+		if result.major == 5 {
+			count *= 2
+		}
+		// Every child occupies at least one byte, so a count beyond the
+		// remaining budget fails before any child is read.
+		if count > uint64(parser.options.MaxEncodedBytes-parser.pos) {
+			return newError(ErrLimit, result.start, "container exceeds encoded size limit")
+		}
+		// Decoders allocate a container's elements before reading them, so
+		// in slice mode a count the remaining input cannot hold fails here,
+		// keeping every allocation proportional to bytes actually present.
+		if parser.reader == nil && count > uint64(len(parser.data)-parser.pos) {
+			return io.ErrUnexpectedEOF
+		}
+	case 6:
+		if parser.options.RejectTags {
+			return newError(ErrUnsupported, result.start, "tags rejected by decoder options")
+		}
+	case 7:
+		switch {
+		case result.minor == 24 && result.argument < 32:
+			return newError(ErrMalformed, result.start, "two-byte simple value below 32")
+		case result.isFloat() && parser.options.RequireDeterministic:
+			if minor, bits := shortestFloat(result.float()); minor != result.minor || bits != result.argument {
+				return newError(ErrNotDeterministic, result.start, "floating-point value not in shortest form")
+			}
+		}
+	}
+	result.end = parser.pos
+	return nil
+}
+
+// argument reads the argument of a header whose additional information is
+// 24 or more: a one- to eight-byte integer, or a reserved value.
+func (parser *parser) argument(result *item) error {
 	switch {
-	case result.minor < 24:
-		return nil
 	case result.minor == 31:
 		if result.major >= 2 && result.major <= 5 {
-			return newError(ErrUnsupported, start, "indefinite-length item")
+			return newError(ErrUnsupported, result.start, "indefinite-length item")
 		}
-		return newError(ErrMalformed, start, "unexpected break or indefinite-length header")
+		return newError(ErrMalformed, result.start, "unexpected break or indefinite-length header")
 	case result.minor >= 28:
-		return newError(ErrMalformed, start, "reserved additional information")
+		return newError(ErrMalformed, result.start, "reserved additional information")
 	}
 	width := 1 << (result.minor - 24)
 	encoded, err := parser.read(width)
@@ -159,70 +260,94 @@ func (parser *parser) header(result *item) error {
 		result.argument = result.argument<<8 | uint64(octet)
 	}
 	if result.major != 7 && parser.options.RejectNonMinimal && !minimal(result.argument, width) {
-		return newError(ErrNotDeterministic, start, "non-minimal argument")
+		return newError(ErrNotDeterministic, result.start, "non-minimal argument")
 	}
 	return nil
 }
 
-// parse records one item, and its subtree, in the arena and returns its index.
-func (parser *parser) parse(depth int) (int, error) {
-	if depth > parser.options.MaxNestedLevels {
-		return 0, newError(ErrLimit, len(parser.data), "nesting limit exceeded")
+// ordered checks that key follows the key at previous in bytewise
+// lexicographic order of their encodings, as RequireDeterministic demands.
+// Deterministic encoding gives equal keys equal encodings, so an equal
+// encoding is reported as the duplicate it is.
+func (parser *parser) ordered(previous int, key *item) error {
+	before := readItem(parser.data, previous)
+	switch bytes.Compare(parser.data[before.start:before.end], parser.data[key.start:key.end]) {
+	case 0:
+		return newError(ErrInvalid, key.start, "duplicate map key")
+	case 1:
+		return newError(ErrNotDeterministic, key.start, "map keys not in bytewise lexicographic order")
 	}
-	index := len(parser.items)
-	if index == cap(parser.items) {
-		parser.grow()
+	return nil
+}
+
+// readKey reads a map key and checks its type and, after the key at
+// previous (-1 for the first), its order. Duplicates are left to the
+// caller, which detects them when it stores the key.
+func (parser *parser) readKey(key *item, previous, depth int) error {
+	if err := parser.item(key, depth); err != nil {
+		return err
 	}
-	// header assigns start, major, minor and argument, and end and next are
-	// assigned below, so the reused slot needs no zeroing.
-	parser.items = parser.items[:index+1]
-	result := &parser.items[index]
-	if err := parser.header(result); err != nil {
-		return 0, err
+	if err := checkKeyType(key); err != nil {
+		return err
 	}
-	switch result.major {
-	case 2, 3:
-		limit := parser.options.MaxBytes
-		if result.major == 3 {
-			limit = parser.options.MaxStringBytes
-		}
-		if result.argument > uint64(limit) {
-			return 0, newError(ErrLimit, result.start, "string size limit exceeded")
-		}
-		payload := len(parser.data)
-		encoded, err := parser.read(int(result.argument))
-		if err != nil {
-			return 0, err
-		}
-		if result.major == 3 && !utf8.Valid(encoded) {
-			return 0, newError(ErrInvalid, payload, "invalid UTF-8")
-		}
-	case 4, 5:
-		if err := parser.container(index, depth); err != nil {
-			return 0, err
-		}
-		result = &parser.items[index] // the arena may have moved
-	case 6:
-		if parser.options.RejectTags {
-			return 0, newError(ErrUnsupported, result.start, "tags rejected by decoder options")
-		}
-		if _, err := parser.parse(depth + 1); err != nil {
-			return 0, err
-		}
-		result = &parser.items[index]
-	case 7:
-		switch {
-		case result.minor == 24 && result.argument < 32:
-			return 0, newError(ErrMalformed, result.start, "two-byte simple value below 32")
-		case result.isFloat() && parser.options.RequireDeterministic:
-			if minor, bits := shortestFloat(result.float()); minor != result.minor || bits != result.argument {
-				return 0, newError(ErrNotDeterministic, result.start, "floating-point value not in shortest form")
+	if parser.options.RequireDeterministic && previous >= 0 {
+		return parser.ordered(previous, key)
+	}
+	return nil
+}
+
+// skip reads and validates one whole item, without decoding it.
+func (parser *parser) skip(result *item, depth int) error {
+	if err := parser.item(result, depth); err != nil {
+		return err
+	}
+	return parser.skipRest(result, depth)
+}
+
+// skipRest reads and validates the children of an item read by item, and
+// records where the item ends.
+func (parser *parser) skipRest(value *item, depth int) error {
+	switch value.major {
+	case 4:
+		var child item
+		for range value.argument {
+			if err := parser.skip(&child, depth+1); err != nil {
+				return err
 			}
 		}
+	case 5:
+		var keys keySet
+		var key, child item
+		for range value.argument {
+			if err := parser.key(&keys, &key, depth+1); err != nil {
+				return err
+			}
+			if err := parser.skip(&child, depth+1); err != nil {
+				return err
+			}
+		}
+	case 6:
+		var child item
+		if err := parser.skip(&child, depth+1); err != nil {
+			return err
+		}
 	}
-	result.end = uint32(len(parser.data))
-	result.next = uint32(len(parser.items))
-	return index, nil
+	value.end = parser.pos
+	return nil
+}
+
+// key reads and validates a map key: it must be a scalar other than NaN,
+// distinct from the map's earlier keys, which keys holds, and under
+// RequireDeterministic after them in bytewise lexicographic order.
+func (parser *parser) key(keys *keySet, key *item, depth int) error {
+	previous := -1
+	if keys.count > 0 {
+		previous = keys.last
+	}
+	if err := parser.readKey(key, previous, depth); err != nil {
+		return err
+	}
+	return keys.add(parser.data, key)
 }
 
 func minimal(argument uint64, width int) bool {
@@ -237,54 +362,24 @@ func minimal(argument uint64, width int) bool {
 	return argument > math.MaxUint32
 }
 
-func (parser *parser) container(index, depth int) error {
-	result := parser.items[index]
-	limit := parser.options.MaxArrayElements
-	if result.major == 5 {
-		limit = parser.options.MaxMapPairs
-	}
-	if result.argument > uint64(limit) {
-		return newError(ErrLimit, result.start, "container size limit exceeded")
-	}
-	count := result.argument
-	if result.major == 5 {
-		count *= 2
-	}
-	// Every child occupies at least one byte, so a count beyond the remaining
-	// budget fails before any child is read.
-	if count > uint64(parser.options.MaxEncodedBytes-len(parser.data)) {
-		return newError(ErrLimit, result.start, "container exceeds encoded size limit")
-	}
-	if result.major == 4 {
-		for range count {
-			if _, err := parser.parse(depth + 1); err != nil {
-				return err
-			}
+// readItem re-reads the header of a scalar item that item already
+// validated at start.
+func readItem(data []byte, start int) item {
+	initial := data[start]
+	value := item{start: start, major: initial >> 5, minor: initial & 31}
+	value.argument = uint64(value.minor)
+	value.end = start + 1
+	if value.minor >= 24 {
+		value.argument = 0
+		for _, octet := range data[value.end : value.end+1<<(value.minor-24)] {
+			value.argument = value.argument<<8 | uint64(octet)
 		}
-		return nil
+		value.end += 1 << (value.minor - 24)
 	}
-	var keys keySet
-	previous := -1
-	for range result.argument {
-		key, err := parser.parse(depth + 1)
-		if err != nil {
-			return err
-		}
-		if err := keys.add(parser.data, parser.items, key); err != nil {
-			return err
-		}
-		if parser.options.RequireDeterministic && previous >= 0 {
-			before, current := &parser.items[previous], &parser.items[key]
-			if bytes.Compare(parser.data[before.start:before.end], parser.data[current.start:current.end]) >= 0 {
-				return newError(ErrNotDeterministic, current.start, "map keys not in bytewise lexicographic order")
-			}
-		}
-		previous = key
-		if _, err := parser.parse(depth + 1); err != nil {
-			return err
-		}
+	if value.major == 2 || value.major == 3 {
+		value.end += int(value.argument)
 	}
-	return nil
+	return value
 }
 
 // keyID identifies a map key in the CBOR data model, independent of argument
@@ -295,14 +390,15 @@ type keyID struct {
 	text     string
 }
 
-// keySet detects duplicate map keys. Small maps keep a fingerprint and arena
-// index per key on the stack and compare keys in full only when
+// keySet detects duplicate map keys. Small maps keep a fingerprint and
+// offset per key on the stack and compare keys in full only when
 // fingerprints match; larger maps switch to a hash set.
 type keySet struct {
-	count     int // keys added so far
-	ids       map[keyID]struct{}
-	prints    [linearKeyScan]uint64
-	positions [linearKeyScan]uint32
+	count  int // keys added so far
+	last   int // offset of the last key added
+	ids    map[keyID]struct{}
+	prints [linearKeyScan]uint64
+	starts [linearKeyScan]int
 }
 
 const linearKeyScan = 16
@@ -315,7 +411,7 @@ func fingerprint(data []byte, key *item) uint64 {
 	switch {
 	case key.major == 2 || key.major == 3:
 		print := uint64(key.major)<<61 ^ key.argument
-		for _, octet := range data[key.payload():min(key.payload()+8, int(key.end))] {
+		for _, octet := range data[key.payload():min(key.payload()+8, key.end)] {
 			print = print<<8 ^ print>>56 ^ uint64(octet)
 		}
 		return print
@@ -329,26 +425,27 @@ func fingerprint(data []byte, key *item) uint64 {
 	return uint64(key.major)<<61 ^ key.argument
 }
 
-func (keys *keySet) add(data []byte, items []item, index int) error {
-	key := &items[index]
-	if err := checkKeyType(key); err != nil {
-		return err
-	}
+func (keys *keySet) add(data []byte, key *item) error {
+	keys.last = key.start
 	if keys.count < linearKeyScan {
 		print := fingerprint(data, key)
 		for position, previous := range keys.prints[:keys.count] {
-			if previous == print && sameKey(data, &items[keys.positions[position]], key) {
-				return newError(ErrInvalid, key.start, "duplicate map key")
+			if previous == print {
+				before := readItem(data, keys.starts[position])
+				if sameKey(data, &before, key) {
+					return newError(ErrInvalid, key.start, "duplicate map key")
+				}
 			}
 		}
-		keys.prints[keys.count], keys.positions[keys.count] = print, uint32(index)
+		keys.prints[keys.count], keys.starts[keys.count] = print, key.start
 		keys.count++
 		return nil
 	}
 	if keys.ids == nil {
 		keys.ids = make(map[keyID]struct{}, 2*linearKeyScan)
-		for _, position := range keys.positions {
-			keys.ids[identify(data, &items[position])] = struct{}{}
+		for _, start := range keys.starts {
+			before := readItem(data, start)
+			keys.ids[identify(data, &before)] = struct{}{}
 		}
 	}
 	id := identify(data, key)
@@ -360,7 +457,16 @@ func (keys *keySet) add(data []byte, items []item, index int) error {
 	return nil
 }
 
+// checkKeyType rejects composite and NaN keys. Integer and string keys, the
+// common case, pass without a call.
 func checkKeyType(key *item) error {
+	if key.major <= 3 {
+		return nil
+	}
+	return checkKeyTypeSlow(key)
+}
+
+func checkKeyTypeSlow(key *item) error {
 	if key.major == 4 || key.major == 5 || key.major == 6 {
 		return newError(ErrUnsupported, key.start, "composite map keys unsupported")
 	}

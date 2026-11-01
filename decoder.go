@@ -64,7 +64,8 @@ type DecoderOptions struct {
 
 	// MaxEncodedBytes limits the encoded size of one item. The default is
 	// DefaultMaxEncodedBytes and the maximum is math.MaxInt32. Decoding
-	// indexes at most 24 bytes of memory per encoded byte.
+	// builds no index of the input, so its memory is that of the decoded
+	// value.
 	MaxEncodedBytes int
 
 	// RejectTags fails decoding with ErrUnsupported at any tag.
@@ -163,22 +164,17 @@ func (options DecoderOptions) Unmarshal(data []byte, destination any) error {
 	if err != nil {
 		return err
 	}
-	if options, err = options.normalized(); err != nil {
-		return err
+	settings := &defaultOptions
+	if options != (DecoderOptions{}) {
+		if options, err = options.normalized(); err != nil {
+			return err
+		}
+		settings = &options
 	}
-	state := getState(&options)
+	state := getState(settings)
 	defer putState(state)
-	parser := parser{input: data, options: options, items: state.items}
-	root, err := parser.parse(0)
-	state.items = parser.items
-	if err != nil {
-		return err
-	}
-	if len(parser.data) != len(data) {
-		return newError(ErrMalformed, len(parser.data), "trailing data")
-	}
-	state.data = parser.data
-	return store(target, state, root)
+	state.setInput(data)
+	return store(target, state)
 }
 
 // Decode reads one item. Clean stream exhaustion returns io.EOF; truncated
@@ -197,15 +193,18 @@ func (decoder *Decoder) Decode(destination any) error {
 	}
 	state := getState(&options)
 	defer putState(state)
-	parser := parser{reader: decoder.reader, options: options, data: decoder.buffer[:0], items: state.items}
-	root, err := parser.parse(0)
-	state.items = parser.items
-	if err == nil {
-		state.data = parser.data
-		err = store(target, state, root)
+	// A stream's remaining length is unknown, so read and validate the whole
+	// item before decoding it from the buffer; allocations sized from its
+	// counts are then bounded by bytes actually received.
+	state.reader, state.data = decoder.reader, decoder.buffer[:0]
+	var whole item
+	if err = state.skip(&whole, 0); err == nil {
+		state.reader = nil
+		state.setInput(state.data)
+		err = store(target, state)
 	}
-	if cap(parser.data) <= maxRetainedBuffer {
-		decoder.buffer = parser.data
+	if cap(state.data) <= maxRetainedBuffer {
+		decoder.buffer = state.data
 	}
 	return err
 }
@@ -240,24 +239,52 @@ func destinationValue(destination any) (reflect.Value, error) {
 	return value, nil
 }
 
-// store decodes into a zero value and replaces the destination only on
-// success, so failed decodes leave it unchanged. A destination that is
-// already zero, the common case, is decoded in place and reset on failure,
-// which saves allocating the replacement.
-func store(target reflect.Value, state *decodeState, root int) error {
+// store reads one item from state and decodes it into a zero value, then
+// replaces the destination only on success, so failed decodes leave it
+// unchanged. A destination that is already zero, the common case, is decoded
+// in place and reset on failure, which saves allocating the replacement.
+//
+// Decoding and validation are one pass, so UnmarshalCBOR calls are queued
+// and run only once the whole item, and in slice mode the absence of
+// trailing data, has been validated.
+func store(target reflect.Value, state *decodeState) error {
 	destination := target.Elem()
 	decode := decoderFor(destination.Type())
-	if destination.IsZero() {
-		if err := decode(state, destination, root); err != nil {
-			destination.SetZero()
+	inPlace := destination.IsZero()
+	replacement := destination
+	if !inPlace {
+		replacement = reflect.New(destination.Type()).Elem()
+	}
+	if inPlace {
+		// A panicking UnmarshalCBOR must not leave a partly decoded value.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				destination.SetZero()
+				panic(recovered)
+			}
+		}()
+	}
+	err := func() error {
+		var root item
+		if err := state.item(&root, 0); err != nil {
 			return err
 		}
-		return nil
-	}
-	replacement := reflect.New(destination.Type()).Elem()
-	if err := decode(state, replacement, root); err != nil {
+		if err := decode(state, replacement, root, 0); err != nil {
+			return err
+		}
+		if state.reader == nil && state.pos != len(state.data) {
+			return newError(ErrMalformed, state.pos, "trailing data")
+		}
+		return state.flush()
+	}()
+	if err != nil {
+		if inPlace {
+			destination.SetZero()
+		}
 		return err
 	}
-	destination.Set(replacement)
+	if !inPlace {
+		destination.Set(replacement)
+	}
 	return nil
 }

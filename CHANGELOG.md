@@ -46,14 +46,16 @@ Changes since `f5df8ee`, the last revision before
 - Type error messages name the item and destination, such as `cannot decode
   text string into int` or `negative integer overflows uint8`.
 - `MaxEncodedBytes` above `math.MaxInt32` is an invalid option.
-- Decoding and encoding are rebuilt on a pooled parse arena and per-type
-  compiled codecs: about 40% less time, 69% fewer bytes and 46% fewer
-  allocations across the package benchmarks.
+- Decoding and encoding are rebuilt on per-type compiled codecs. Decoding
+  validates and decodes in one pass and builds no index of the input;
+  `UnmarshalCBOR` calls are queued and run once the whole item is valid, so
+  a failure still leaves the destination unchanged. Struct decoding matches
+  fxamacker/cbor v2.10.0 with strict checks enabled.
 - Duplicate map keys are found through per-map key fingerprints on the
-  stack, so a full comparison runs only for keys that may be equal.
-- The densest adversarial input, one-byte items, allocates about 50 bytes
-  per input byte instead of about 182: arena items take 24 bytes, and the
-  arena doubles, bounded by what the remaining input could hold.
+  stack, so a full comparison runs only for keys that may be equal; maps
+  decoded into Go maps detect them through the map itself.
+- The densest adversarial input, one-byte items, allocates about one byte
+  per input byte instead of about 182.
 
 ### Removed
 
