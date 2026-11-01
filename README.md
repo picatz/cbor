@@ -12,9 +12,9 @@ built for security protocols such as COSE, CWT, WebAuthn and CTAP2:
 - **Schemas in struct tags.** Integer keys, required fields, unknown-field
   rejection, `toarray` structs and typed tags describe COSE and CWT messages
   without hand-written map walking.
-- **Fast.** Faster than [fxamacker/cbor](https://github.com/fxamacker/cbor)
-  on COSE, CWT and CTAP2 payloads, with the same allocations for COSE and CWT
-  messages; [see below](#performance).
+- **Fast.** Within about 10–25% of [fxamacker/cbor](https://github.com/fxamacker/cbor)
+  v2.10 on COSE, CWT and CTAP2 payloads, with the same allocations for COSE
+  and CWT messages, and without `unsafe`; [see below](#performance).
 - **No dependencies**, and differentially tested against fxamacker/cbor.
 
 This package supports a deliberately bounded, definite-length CBOR subset.
@@ -196,20 +196,25 @@ each order, and pooled scratch buffers for map entries. The only steady-state
 allocations are the decoded strings and byte slices, which never alias the
 input, and the returned encoding.
 
-Side by side with fxamacker/cbor v2.9.6 (strict duplicate-key and UTF-8
+Side by side with fxamacker/cbor v2.10.0 (strict duplicate-key and UTF-8
 checks, core deterministic encoding), as benchstat medians of ten runs on a
 shared linux/amd64 VM. "~" marks a difference that is not statistically
 significant.
 
 | Benchmark | picatz/cbor | fxamacker/cbor | Time |
 |-----------|-------------|----------------|------|
-| Decode RFC 8392 CWT claims into a struct | 733 ns, 5 allocs | 777 ns, 5 allocs | −6% |
-| Decode an RFC 9052 EC2 COSE_Key | 619 ns, 4 allocs | 710 ns, 4 allocs | −13% |
-| Decode a CTAP2 `getInfo` response into `any` | 3.40 µs, 52 allocs | 3.82 µs, 52 allocs | −11% |
-| Encode CWT claims | 253 ns, 1 alloc | 272 ns, 1 alloc | −7% |
-| Encode a COSE_Key | 242 ns, 1 alloc | 250 ns, 1 alloc | ~ |
-| Encode the `getInfo` response from `any` | 1.51 µs, 3 allocs | 2.83 µs, 5 allocs | −47% |
-| Encode a `map[string]bool` | 617 ns, 3 allocs | 652 ns, 2 allocs | −5% |
+| Decode RFC 8392 CWT claims into a struct | 772 ns, 5 allocs | 613 ns, 5 allocs | +26% |
+| Decode an RFC 9052 EC2 COSE_Key | 625 ns, 4 allocs | 494 ns, 4 allocs | +27% |
+| Decode a CTAP2 `getInfo` response into `any` | 3.57 µs, 52 allocs | 3.21 µs, 52 allocs | +11% |
+| Encode CWT claims | 236 ns, 1 alloc | 213 ns, 1 alloc | +11% |
+| Encode a COSE_Key | 272 ns, 1 alloc | 201 ns, 1 alloc | +36% |
+| Encode the `getInfo` response from `any` | 1.59 µs, 3 allocs | 1.57 µs, 1 alloc | ~ |
+| Encode a `map[string]bool` | 626 ns, 3 allocs | 510 ns, 1 alloc | +23% |
+
+The remaining gap is mostly reflection's per-field cost and the separate
+validation pass that lets a failed decode leave its destination unchanged.
+Against fxamacker/cbor v2.9.6, the previous release, this package was faster
+on seven of these eight benchmarks.
 
 Reproduce with `cd interop && go test -run '^$' -bench . -benchmem`, and
 compare revisions with [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat).

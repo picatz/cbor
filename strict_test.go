@@ -261,3 +261,52 @@ func FuzzDecode(fuzzer *testing.F) {
 		}
 	})
 }
+
+// TestZeroOptionsMatchExplicitDefaults pins the zero-value fast path in
+// option normalization to the documented defaults.
+func TestZeroOptionsMatchExplicitDefaults(t *testing.T) {
+	explicit := cbor.DecoderOptions{
+		MaxArrayElements: cbor.DefaultMaxValue, MaxMapPairs: cbor.DefaultMaxValue,
+		MaxStringBytes: cbor.DefaultMaxValue, MaxBytes: cbor.DefaultMaxValue,
+		MaxNestedLevels: cbor.DefaultMaxNestedLevels, MaxEncodedBytes: cbor.DefaultMaxEncodedBytes,
+	}
+	for _, data := range [][]byte{
+		append([]byte{0x99, 0x27, 0x10}, make([]byte, cbor.DefaultMaxValue)...),
+		append([]byte{0x99, 0x27, 0x11}, make([]byte, cbor.DefaultMaxValue+1)...),
+		bytes.Repeat([]byte{0x81}, cbor.DefaultMaxNestedLevels+1),
+		append([]byte{0x7a, 0x00, 0x00, 0x27, 0x11}, bytes.Repeat([]byte{'a'}, cbor.DefaultMaxValue+1)...),
+	} {
+		zero := (cbor.DecoderOptions{}).Unmarshal(data, new(cbor.RawMessage))
+		full := explicit.Unmarshal(data, new(cbor.RawMessage))
+		if (zero == nil) != (full == nil) || zero != nil && zero.Error() != full.Error() {
+			t.Errorf("% x...: zero options %v, explicit defaults %v", data[:3], zero, full)
+		}
+	}
+}
+
+// TestDuplicateKeyFingerprints covers keys whose fingerprints collide or
+// whose encodings differ while their values are equal.
+func TestDuplicateKeyFingerprints(t *testing.T) {
+	for _, test := range []struct {
+		encoded string
+		valid   bool
+	}{
+		{"a2616101616102", false},                                     // "a" twice
+		{"a2616101410102", true},                                      // "a" and h'61'
+		{"a2 69616263646566676869 01 6961626364656667686a 02", true},  // same length and first 8 bytes
+		{"a2 69616263646566676869 01 69616263646566676869 02", false}, // the same 9-byte key twice
+		{"a2 686162636465666768 01 69616263646566676869 02", true},    // a key and its extension
+		{"a201021801 03", false},                                      // 1 and 0x1801
+		{"a2f93c0001fb3ff000000000000002", false},                     // 1.0 as binary16 and binary64
+		{"a2f9000001f9800002", false},                                 // +0.0 and -0.0
+		{"a2f93c00010102", true},                                      // 1.0 and 1
+		{"a2f4 01f5 02", true},                                        // false and true
+		{"a2f7 01f7 02", false},                                       // undefined twice
+	} {
+		data := mustHex(strings.ReplaceAll(test.encoded, " ", ""))
+		err := cbor.Unmarshal(data, new(cbor.RawMessage))
+		if test.valid != (err == nil) || !test.valid && !errors.Is(err, cbor.ErrInvalid) {
+			t.Errorf("%s: %v, want valid %v", test.encoded, err, test.valid)
+		}
+	}
+}

@@ -115,7 +115,17 @@ func NewDecoderWithOptions(reader io.Reader, options DecoderOptions) *Decoder {
 	return &Decoder{reader: reader, options: options}
 }
 
+// defaultOptions is the zero DecoderOptions after normalization.
+var defaultOptions = DecoderOptions{
+	MaxArrayElements: DefaultMaxValue, MaxMapPairs: DefaultMaxValue,
+	MaxStringBytes: DefaultMaxValue, MaxBytes: DefaultMaxValue,
+	MaxNestedLevels: DefaultMaxNestedLevels, MaxEncodedBytes: DefaultMaxEncodedBytes,
+}
+
 func (options DecoderOptions) normalized() (DecoderOptions, error) {
+	if options == (DecoderOptions{}) {
+		return defaultOptions, nil
+	}
 	for _, limit := range [...]*int{&options.MaxArrayElements, &options.MaxMapPairs, &options.MaxStringBytes, &options.MaxBytes} {
 		if *limit < 0 {
 			return options, errors.New("cbor: negative decoder limit")
