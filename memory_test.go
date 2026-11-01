@@ -27,9 +27,9 @@ func TestDecodeMemoryAmplification(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime.ReadMemStats(&after)
-	// 24 bytes of index per item, at most doubled while the arena grows,
-	// plus the RawMessage copy.
-	if ratio := float64(after.TotalAlloc-before.TotalAlloc) / float64(len(data)); ratio > 52 {
+	// Decoding builds no index of the input, so this is the RawMessage copy
+	// and the pooled decoder state.
+	if ratio := float64(after.TotalAlloc-before.TotalAlloc) / float64(len(data)); ratio > 4 {
 		t.Fatalf("decoding %d bytes allocated %.1f bytes per input byte", len(data), ratio)
 	}
 }

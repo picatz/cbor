@@ -7,76 +7,186 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
-// decodeState converts parsed items into Go values. data is the buffer the
-// items' offsets refer to; decoded values never alias it.
+// decodeState converts items into Go values as the parser reads them.
+// Decoded values never alias the parser's data.
 //
 // Every decoderFunc writes into a zero value: the destination is a fresh
 // replacement, and containers reset their scratch elements between entries.
+// Nothing a decoderFunc does is observable until the whole item has been
+// validated: calls into application code, and the map insertions that would
+// copy their receivers, are queued in pending and run by flush afterwards.
 type decodeState struct {
-	data          []byte
-	items         []item
+	parser
 	rejectUnknown bool // reject keys that match no struct field exactly
 	deterministic bool // require preferred serialization of bignums
+	pending       []pendingOp
+	scratch       DecoderOptions // options, when not the shared defaults
+}
+
+// pendingOp is a deferred UnmarshalCBOR call on receiver, or when receiver
+// is nil, a deferred map insertion whose key or element awaits such a call.
+type pendingOp struct {
+	receiver   Unmarshaler
+	start, end int // the receiver's item, or the key's offset for errors
+	target     reflect.Value
+	key        reflect.Value
+	element    reflect.Value
 }
 
 var statePool = sync.Pool{New: func() any { return new(decodeState) }}
 
+// getState returns a pooled state configured with options, which the state
+// copies unless it is the shared defaults, so the caller's value need not
+// outlive the call or leave its stack.
 func getState(options *DecoderOptions) *decodeState {
 	state := statePool.Get().(*decodeState)
+	if options == &defaultOptions {
+		state.options = &defaultOptions
+	} else {
+		state.scratch = *options
+		state.options = &state.scratch
+	}
 	state.rejectUnknown = options.RejectUnknownFields
 	state.deterministic = options.RequireDeterministic
 	return state
 }
 
+// maxPooledPending bounds the queue kept for reuse, so one large item does
+// not pin memory for the life of the process.
+const maxPooledPending = 4096
+
 func putState(state *decodeState) {
-	state.data = nil
-	if cap(state.items) > maxPooledItems {
-		state.items = nil
+	state.reader, state.data, state.pos, state.limit = nil, nil, 0, 0
+	if cap(state.pending) > maxPooledPending {
+		state.pending = nil
 	}
-	state.items = state.items[:0]
+	clear(state.pending)
+	state.pending = state.pending[:0]
 	statePool.Put(state)
 }
 
-// decoderFunc decodes the item at index into destination, which is
-// addressable and holds its type's zero value.
-type decoderFunc func(state *decodeState, destination reflect.Value, index int) error
+// enqueue queues an UnmarshalCBOR call on the validated item value.
+func (state *decodeState) enqueue(receiver Unmarshaler, value *item) {
+	state.pending = append(state.pending, pendingOp{receiver: receiver, start: value.start, end: value.end})
+}
 
-// decoderCache maps a reflect.Type to its decoderFunc.
-var decoderCache sync.Map
+// flush runs the queued operations in order, once the whole item is valid.
+func (state *decodeState) flush() error {
+	for position := range state.pending {
+		op := &state.pending[position]
+		if op.receiver != nil {
+			if err := op.receiver.UnmarshalCBOR(state.data[op.start:op.end:op.end]); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := insert(op.target, op.key, op.element, op.start); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-// decoderFor returns the decoder for a type, building it once. Recursive
-// types receive an indirect decoder while their own is under construction.
+// insert adds one entry to a decoded map. Keys equal in the CBOR data model
+// decode to equal Go keys, and so can distinct keys, such as through an
+// Unmarshaler; either is a duplicate.
+func insert(target, key, element reflect.Value, offset int) error {
+	before := target.Len()
+	target.SetMapIndex(key, element)
+	if target.Len() == before {
+		return newError(ErrInvalid, offset, "duplicate map key")
+	}
+	return nil
+}
+
+// valueKeys reports whether a map with keys of kind detects every pair of
+// keys equal in the CBOR data model through insert alone, because such keys
+// decode, without application code, to Go values that compare equal. Keys
+// holding pointers compare by address, so those maps also keep a keySet.
+func valueKeys(kind reflect.Type) bool {
+	if deferred(kind) {
+		return false
+	}
+	switch kind.Kind() {
+	case reflect.Bool, reflect.String, reflect.Interface,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	case reflect.Array:
+		return valueKeys(kind.Elem())
+	}
+	return false
+}
+
+// decoderFunc decodes the item whose header value was read by parser.item
+// at nesting depth into destination, which is addressable and holds its
+// type's zero value. It consumes the item's remaining bytes.
+type decoderFunc func(state *decodeState, destination reflect.Value, value item, depth int) error
+
+// typeDecoder is a cache entry: a type and its decoder. Entries are
+// immutable, so the one looked up last can be published without a lock.
+type typeDecoder struct {
+	kind        reflect.Type
+	decode      decoderFunc
+	placeholder bool // decode waits for the type's decoder to be built
+}
+
+// decoderCache maps a reflect.Type to its *typeDecoder, and lastDecoder is
+// the entry looked up last, which a caller decoding one type repeatedly
+// finds without hashing.
+var (
+	decoderCache sync.Map
+	lastDecoder  atomic.Pointer[typeDecoder]
+)
+
+// decoderFor returns the decoder for a type, building it once.
 func decoderFor(kind reflect.Type) decoderFunc {
+	if last := lastDecoder.Load(); last != nil && last.kind == kind {
+		return last.decode
+	}
+	entry := decoderEntry(kind)
+	if !entry.placeholder {
+		lastDecoder.Store(entry)
+	}
+	return entry.decode
+}
+
+// decoderEntry returns the cache entry for a type, building its decoder
+// once. Recursive types receive a placeholder entry while their own is under
+// construction.
+func decoderEntry(kind reflect.Type) *typeDecoder {
 	if cached, ok := decoderCache.Load(kind); ok {
-		return cached.(decoderFunc)
+		return cached.(*typeDecoder)
 	}
 	var (
 		ready   sync.WaitGroup
 		decoder decoderFunc
 	)
 	ready.Add(1)
-	cached, loaded := decoderCache.LoadOrStore(kind, decoderFunc(func(state *decodeState, destination reflect.Value, index int) error {
+	placeholder := &typeDecoder{kind: kind, placeholder: true, decode: func(state *decodeState, destination reflect.Value, value item, depth int) error {
 		ready.Wait()
-		return decoder(state, destination, index)
-	}))
-	if loaded {
-		return cached.(decoderFunc)
+		return decoder(state, destination, value, depth)
+	}}
+	if cached, loaded := decoderCache.LoadOrStore(kind, placeholder); loaded {
+		return cached.(*typeDecoder)
 	}
 	defer func() {
 		if decoder == nil {
 			// Construction panicked: release any waiters with an error and
 			// drop the placeholder, so the cache is not left poisoned.
-			decoderCache.CompareAndDelete(kind, cached)
-			decoder = func(*decodeState, reflect.Value, int) error {
+			decoderCache.CompareAndDelete(kind, placeholder)
+			decoder = func(*decodeState, reflect.Value, item, int) error {
 				return encodeError(ErrUnsupported, "no decoder for "+kind.String())
 			}
 		}
 		ready.Done()
 	}()
-	built := newDecoder(kind)
-	decoder = built
+	built := &typeDecoder{kind: kind, decode: newDecoder(kind)}
+	decoder = built.decode
 	decoderCache.Store(kind, built)
 	return built
 }
@@ -141,9 +251,37 @@ func newDecoder(kind reflect.Type) decoderFunc {
 	return decodeUnsupported
 }
 
-func (state *decodeState) raw(index int) []byte {
-	value := &state.items[index]
-	return state.data[value.start:value.end:value.end]
+// deferred reports whether decoding into kind can queue an UnmarshalCBOR
+// call, which writes to its receiver only when flush runs. A map whose keys
+// or elements can must not copy them into the map before then.
+func deferred(kind reflect.Type) bool {
+	return deferredWithin(kind, map[reflect.Type]bool{})
+}
+
+func deferredWithin(kind reflect.Type, visited map[reflect.Type]bool) bool {
+	if kind == rawMessageType {
+		return false // decoded directly, without calling UnmarshalCBOR
+	}
+	if kind.Implements(unmarshalerType) || kind.Kind() != reflect.Pointer && reflect.PointerTo(kind).Implements(unmarshalerType) {
+		return true
+	}
+	if visited[kind] {
+		return false
+	}
+	visited[kind] = true
+	switch kind.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		return deferredWithin(kind.Elem(), visited)
+	case reflect.Map:
+		return deferredWithin(kind.Key(), visited) || deferredWithin(kind.Elem(), visited)
+	case reflect.Struct:
+		for position := range kind.NumField() {
+			if deferredWithin(kind.Field(position).Type, visited) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (state *decodeState) payload(value *item) []byte {
@@ -188,33 +326,44 @@ func describe(value *item) string {
 	return "simple value"
 }
 
-func decodeUnsupported(state *decodeState, destination reflect.Value, index int) error {
-	return state.typeError(&state.items[index], destination.Type())
+func decodeUnsupported(state *decodeState, destination reflect.Value, value item, depth int) error {
+	return state.typeError(&value, destination.Type())
 }
 
-func decodeUnmarshalerPointer(state *decodeState, destination reflect.Value, index int) error {
+func decodeUnmarshalerPointer(state *decodeState, destination reflect.Value, value item, depth int) error {
+	if err := state.skipRest(&value, depth); err != nil {
+		return err
+	}
 	destination.Set(reflect.New(destination.Type().Elem()))
-	return destination.Interface().(Unmarshaler).UnmarshalCBOR(state.raw(index))
+	state.enqueue(destination.Interface().(Unmarshaler), &value)
+	return nil
 }
 
-func decodeUnmarshaler(state *decodeState, destination reflect.Value, index int) error {
-	return destination.Addr().Interface().(Unmarshaler).UnmarshalCBOR(state.raw(index))
+func decodeUnmarshaler(state *decodeState, destination reflect.Value, value item, depth int) error {
+	if err := state.skipRest(&value, depth); err != nil {
+		return err
+	}
+	state.enqueue(destination.Addr().Interface().(Unmarshaler), &value)
+	return nil
 }
 
-func decodeRawMessage(state *decodeState, destination reflect.Value, index int) error {
-	destination.SetBytes(bytes.Clone(state.raw(index)))
+func decodeRawMessage(state *decodeState, destination reflect.Value, value item, depth int) error {
+	if err := state.skipRest(&value, depth); err != nil {
+		return err
+	}
+	destination.SetBytes(bytes.Clone(state.data[value.start:value.end]))
 	return nil
 }
 
 func newPointerDecoder(kind reflect.Type) decoderFunc {
 	element := kind.Elem()
 	decode := decoderFor(element)
-	return func(state *decodeState, destination reflect.Value, index int) error {
-		if state.items[index].isNull() {
+	return func(state *decodeState, destination reflect.Value, value item, depth int) error {
+		if value.isNull() {
 			return nil
 		}
 		allocated := reflect.New(element)
-		if err := decode(state, allocated.Elem(), index); err != nil {
+		if err := decode(state, allocated.Elem(), value, depth); err != nil {
 			return err
 		}
 		destination.Set(allocated)
@@ -222,11 +371,11 @@ func newPointerDecoder(kind reflect.Type) decoderFunc {
 	}
 }
 
-func decodeAny(state *decodeState, destination reflect.Value, index int) error {
-	if state.items[index].isNull() {
+func decodeAny(state *decodeState, destination reflect.Value, value item, depth int) error {
+	if value.isNull() {
 		return nil
 	}
-	decoded, err := state.generic(index)
+	decoded, err := state.generic(&value, depth)
 	if err != nil {
 		return err
 	}
@@ -234,29 +383,27 @@ func decodeAny(state *decodeState, destination reflect.Value, index int) error {
 	return nil
 }
 
-func decodeInterface(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeInterface(state *decodeState, destination reflect.Value, value item, depth int) error {
 	if value.isNull() {
 		return nil
 	}
-	decoded, err := state.generic(index)
+	decoded, err := state.generic(&value, depth)
 	if err != nil {
 		return err
 	}
 	reflected := reflect.ValueOf(decoded)
 	if !reflected.Type().AssignableTo(destination.Type()) {
-		return state.typeError(value, destination.Type())
+		return state.typeError(&value, destination.Type())
 	}
 	destination.Set(reflected)
 	return nil
 }
 
-func decodeTaggedValue(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeTaggedValue(state *decodeState, destination reflect.Value, value item, depth int) error {
 	if value.major != 6 {
-		return state.typeError(value, destination.Type())
+		return state.typeError(&value, destination.Type())
 	}
-	decoded, err := state.generic(index)
+	decoded, err := state.generic(&value, depth)
 	if err != nil {
 		return err
 	}
@@ -264,10 +411,9 @@ func decodeTaggedValue(state *decodeState, destination reflect.Value, index int)
 	return nil
 }
 
-func decodeSimpleValue(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeSimpleValue(state *decodeState, destination reflect.Value, value item, depth int) error {
 	if value.major != 7 || value.isFloat() || value.isNull() {
-		return state.typeError(value, destination.Type())
+		return state.typeError(&value, destination.Type())
 	}
 	destination.SetInt(int64(value.argument))
 	return nil
@@ -276,42 +422,42 @@ func decodeSimpleValue(state *decodeState, destination reflect.Value, index int)
 func newTagDecoder(kind reflect.Type) decoderFunc {
 	number, content, ok := tagFields(kind)
 	if !ok {
-		return func(*decodeState, reflect.Value, int) error {
+		return func(*decodeState, reflect.Value, item, int) error {
 			return encodeError(ErrUnsupported, "ambiguous or unexported embedded Tag in "+kind.String())
 		}
 	}
 	contentField := kind.FieldByIndex(content)
 	decode := decoderFor(contentField.Type)
-	return func(state *decodeState, destination reflect.Value, index int) error {
-		value := &state.items[index]
+	return func(state *decodeState, destination reflect.Value, value item, depth int) error {
 		if value.major != 6 {
-			return state.typeError(value, destination.Type())
+			return state.typeError(&value, destination.Type())
+		}
+		var child item
+		if err := state.item(&child, depth+1); err != nil {
+			return err
 		}
 		fieldForDecode(destination, number).SetUint(value.argument)
-		return decode(state, fieldForDecode(destination, content), index+1)
+		return decode(state, fieldForDecode(destination, content), child, depth+1)
 	}
 }
 
-func decodeBool(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeBool(state *decodeState, destination reflect.Value, value item, depth int) error {
 	if value.major == 7 && (value.minor == 20 || value.minor == 21) {
 		destination.SetBool(value.minor == 21)
 		return nil
 	}
-	return state.typeError(value, destination.Type())
+	return state.typeError(&value, destination.Type())
 }
 
-func decodeString(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeString(state *decodeState, destination reflect.Value, value item, depth int) error {
 	if value.major != 3 {
-		return state.typeError(value, destination.Type())
+		return state.typeError(&value, destination.Type())
 	}
-	destination.SetString(string(state.payload(value)))
+	destination.SetString(string(state.payload(&value)))
 	return nil
 }
 
-func decodeInt(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeInt(state *decodeState, destination reflect.Value, value item, depth int) error {
 	var decoded int64
 	switch {
 	case value.major == 0 && value.argument <= math.MaxInt64:
@@ -319,44 +465,42 @@ func decodeInt(state *decodeState, destination reflect.Value, index int) error {
 	case value.major == 1 && value.argument <= math.MaxInt64:
 		decoded = -1 - int64(value.argument)
 	case value.major == 0 || value.major == 1:
-		return state.overflow(value, destination.Type())
+		return state.overflow(&value, destination.Type())
 	default:
-		return state.typeError(value, destination.Type())
+		return state.typeError(&value, destination.Type())
 	}
 	if destination.OverflowInt(decoded) {
-		return state.overflow(value, destination.Type())
+		return state.overflow(&value, destination.Type())
 	}
 	destination.SetInt(decoded)
 	return nil
 }
 
-func decodeUint(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeUint(state *decodeState, destination reflect.Value, value item, depth int) error {
 	switch {
 	case value.major == 1:
-		return state.overflow(value, destination.Type())
+		return state.overflow(&value, destination.Type())
 	case value.major != 0:
-		return state.typeError(value, destination.Type())
+		return state.typeError(&value, destination.Type())
 	case destination.OverflowUint(value.argument):
-		return state.overflow(value, destination.Type())
+		return state.overflow(&value, destination.Type())
 	}
 	destination.SetUint(value.argument)
 	return nil
 }
 
-func decodeFloat(state *decodeState, destination reflect.Value, index int) error {
-	value := &state.items[index]
+func decodeFloat(state *decodeState, destination reflect.Value, value item, depth int) error {
 	if value.isFloat() {
 		decoded := value.float()
 		if destination.OverflowFloat(decoded) {
-			return state.overflow(value, destination.Type())
+			return state.overflow(&value, destination.Type())
 		}
 		destination.SetFloat(decoded)
 		return nil
 	}
-	decoded, ok := exactInteger(value)
+	decoded, ok := exactInteger(&value)
 	if !ok || destination.Kind() == reflect.Float32 && float64(float32(decoded)) != decoded {
-		return state.typeError(value, destination.Type())
+		return state.typeError(&value, destination.Type())
 	}
 	destination.SetFloat(decoded)
 	return nil
@@ -389,25 +533,26 @@ func exactInteger(value *item) (float64, bool) {
 func newSliceDecoder(kind reflect.Type) decoderFunc {
 	byteString := kind.Elem().Kind() == reflect.Uint8
 	element := decoderFor(kind.Elem())
-	return func(state *decodeState, destination reflect.Value, index int) error {
-		value := &state.items[index]
+	return func(state *decodeState, destination reflect.Value, value item, depth int) error {
 		switch {
 		case value.isNull():
 			return nil
 		case byteString && value.major == 2:
-			destination.SetBytes(append(make([]byte, 0, value.argument), state.payload(value)...))
+			destination.SetBytes(append(make([]byte, 0, value.argument), state.payload(&value)...))
 			return nil
 		case value.major != 4:
-			return state.typeError(value, destination.Type())
+			return state.typeError(&value, destination.Type())
 		}
 		count := int(value.argument)
 		slice := reflect.MakeSlice(kind, count, count)
-		child := index + 1
+		var child item
 		for position := range count {
-			if err := element(state, slice.Index(position), child); err != nil {
+			if err := state.item(&child, depth+1); err != nil {
 				return err
 			}
-			child = int(state.items[child].next)
+			if err := element(state, slice.Index(position), child, depth+1); err != nil {
+				return err
+			}
 		}
 		destination.Set(slice)
 		return nil
@@ -418,21 +563,22 @@ func newArrayDecoder(kind reflect.Type) decoderFunc {
 	byteString := kind.Elem().Kind() == reflect.Uint8
 	element := decoderFor(kind.Elem())
 	length := kind.Len()
-	return func(state *decodeState, destination reflect.Value, index int) error {
-		value := &state.items[index]
+	return func(state *decodeState, destination reflect.Value, value item, depth int) error {
 		if byteString && value.major == 2 && value.argument == uint64(length) {
-			copy(destination.Bytes(), state.payload(value))
+			copy(destination.Bytes(), state.payload(&value))
 			return nil
 		}
 		if value.major != 4 || value.argument != uint64(length) {
-			return state.typeError(value, destination.Type())
+			return state.typeError(&value, destination.Type())
 		}
-		child := index + 1
+		var child item
 		for position := range length {
-			if err := element(state, destination.Index(position), child); err != nil {
+			if err := state.item(&child, depth+1); err != nil {
 				return err
 			}
-			child = int(state.items[child].next)
+			if err := element(state, destination.Index(position), child, depth+1); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -442,43 +588,63 @@ func newMapDecoder(kind reflect.Type) decoderFunc {
 	keyType, elementType := kind.Key(), kind.Elem()
 	decodeKey, decodeElement := decoderFor(keyType), decoderFor(elementType)
 	interfaceKey := keyType.Kind() == reflect.Interface
-	return func(state *decodeState, destination reflect.Value, index int) error {
-		value := &state.items[index]
+	// Entries whose key or element awaits an UnmarshalCBOR call are decoded
+	// into fresh values and inserted by flush, after that call has run.
+	deferInsert := deferred(keyType) || deferred(elementType)
+	trackKeys := !valueKeys(keyType)
+	return func(state *decodeState, destination reflect.Value, value item, depth int) error {
 		if value.isNull() {
 			return nil
 		}
 		if value.major != 5 {
-			return state.typeError(value, destination.Type())
+			return state.typeError(&value, destination.Type())
 		}
 		count := int(value.argument)
 		result := reflect.MakeMapWithSize(kind, count)
-		key, element := reflect.New(keyType).Elem(), reflect.New(elementType).Elem()
-		child := index + 1
+		var key, element reflect.Value
+		if !deferInsert {
+			key, element = reflect.New(keyType).Elem(), reflect.New(elementType).Elem()
+		}
+		var keys keySet
+		var keyItem, child item
+		previous := -1
 		for range count {
-			if interfaceKey && state.items[child].major == 1 && state.items[child].argument > math.MaxInt64 {
-				// A *big.Int key would compare by pointer, not by value.
-				return newError(ErrType, state.items[child].start, "integer map key below math.MinInt64 cannot be an interface map key")
+			if err := state.readKey(&keyItem, previous, depth+1); err != nil {
+				return err
 			}
-			key.SetZero()
-			if err := decodeKey(state, key, child); err != nil {
+			if trackKeys {
+				if err := keys.add(state.data, &keyItem); err != nil {
+					return err
+				}
+			}
+			previous = keyItem.start
+			if interfaceKey && keyItem.major == 1 && keyItem.argument > math.MaxInt64 {
+				// A *big.Int key would compare by pointer, not by value.
+				return newError(ErrType, keyItem.start, "integer map key below math.MinInt64 cannot be an interface map key")
+			}
+			if deferInsert {
+				key, element = reflect.New(keyType).Elem(), reflect.New(elementType).Elem()
+			} else {
+				key.SetZero()
+				element.SetZero()
+			}
+			if err := decodeKey(state, key, keyItem, depth+1); err != nil {
 				return err
 			}
 			if interfaceKey && !key.IsNil() && !key.Elem().Type().Comparable() {
-				return newError(ErrType, state.items[child].start, "map key cannot be represented in Go")
+				return newError(ErrType, keyItem.start, "map key cannot be represented in Go")
 			}
-			entry := int(state.items[child].next)
-			element.SetZero()
-			if err := decodeElement(state, element, entry); err != nil {
+			if err := state.item(&child, depth+1); err != nil {
 				return err
 			}
-			// Distinct CBOR keys can decode to equal Go keys, such as
-			// through an Unmarshaler; that is a duplicate in Go terms.
-			before := result.Len()
-			result.SetMapIndex(key, element)
-			if result.Len() == before {
-				return newError(ErrInvalid, state.items[child].start, "duplicate destination map key")
+			if err := decodeElement(state, element, child, depth+1); err != nil {
+				return err
 			}
-			child = int(state.items[entry].next)
+			if deferInsert {
+				state.pending = append(state.pending, pendingOp{start: keyItem.start, target: result, key: key, element: element})
+			} else if err := insert(result, key, element, keyItem.start); err != nil {
+				return err
+			}
 		}
 		destination.Set(result)
 		return nil
@@ -499,6 +665,10 @@ func (set *fieldSet) add(position int) bool {
 		set.small |= 1 << position
 		return true
 	}
+	return set.addLarge(position)
+}
+
+func (set *fieldSet) addLarge(position int) bool {
 	if set.large == nil {
 		set.large = make([]uint64, position/64+1)
 		set.large[0] = set.small
@@ -525,62 +695,90 @@ func (set *fieldSet) has(position int) bool {
 func newStructDecoder(kind reflect.Type) decoderFunc {
 	info, err := structFor(kind)
 	if err != nil {
-		return func(*decodeState, reflect.Value, int) error { return err }
+		return func(*decodeState, reflect.Value, item, int) error { return err }
 	}
 	fields := info.fields
 	decoders := make([]decoderFunc, len(fields))
+	// direct holds the index of a field declared on the struct itself, or
+	// -1 for one promoted from an embedded struct.
+	direct := make([]int, len(fields))
 	for position := range fields {
 		decoders[position] = decoderFor(fields[position].typ)
+		direct[position] = -1
+		if len(fields[position].index) == 1 {
+			direct[position] = fields[position].index[0]
+		}
 	}
 	if info.toArray {
-		return func(state *decodeState, destination reflect.Value, index int) error {
-			value := &state.items[index]
+		return func(state *decodeState, destination reflect.Value, value item, depth int) error {
 			if value.major != 4 {
-				return state.typeError(value, destination.Type())
+				return state.typeError(&value, destination.Type())
 			}
 			if value.argument != uint64(len(fields)) {
 				return newError(ErrType, value.start, "array length does not match the fields of "+destination.Type().String())
 			}
-			child := index + 1
+			var child item
 			for position := range fields {
-				if err := decoders[position](state, fieldForDecode(destination, fields[position].index), child); err != nil {
+				if err := state.item(&child, depth+1); err != nil {
 					return err
 				}
-				child = int(state.items[child].next)
+				if err := decoders[position](state, fieldForDecode(destination, fields[position].index), child, depth+1); err != nil {
+					return err
+				}
 			}
 			return nil
 		}
 	}
-	return func(state *decodeState, destination reflect.Value, index int) error {
-		value := &state.items[index]
+	return func(state *decodeState, destination reflect.Value, value item, depth int) error {
 		if value.major != 5 {
-			return state.typeError(value, destination.Type())
+			return state.typeError(&value, destination.Type())
 		}
+		// Keys that name a field are deduplicated through assigned, since
+		// keys equal in the data model name the same field. Keys that name
+		// none go through keys, as in any map.
 		var assigned fieldSet
-		hint := 0
-		child := index + 1
+		var keys keySet
+		var key, child item
+		hint, previous := 0, -1
 		for range value.argument {
-			key := &state.items[child]
-			entry := int(key.next)
-			position := info.lookup(state.data, key, hint)
+			if err := state.readKey(&key, previous, depth+1); err != nil {
+				return err
+			}
+			previous = key.start
+			position := info.lookup(state.data, &key, hint)
 			if position < 0 {
 				if state.rejectUnknown {
 					return newError(ErrType, key.start, "unknown struct field")
 				}
-				if position = info.fold(state.data, key); position == -2 {
+				if position = info.fold(state.data, &key); position == -2 {
 					return newError(ErrType, key.start, "ambiguous struct field")
 				}
 			}
-			if position >= 0 {
-				if !assigned.add(position) {
-					return newError(ErrInvalid, key.start, "duplicate destination struct field")
-				}
-				if err := decoders[position](state, fieldForDecode(destination, fields[position].index), entry); err != nil {
+			if position < 0 {
+				if err := keys.add(state.data, &key); err != nil {
 					return err
 				}
-				hint = position + 1
+				if err := state.skip(&child, depth+1); err != nil {
+					return err
+				}
+				continue
 			}
-			child = int(state.items[entry].next)
+			if !assigned.add(position) {
+				return newError(ErrInvalid, key.start, "duplicate destination struct field")
+			}
+			if err := state.item(&child, depth+1); err != nil {
+				return err
+			}
+			var field reflect.Value
+			if direct[position] >= 0 {
+				field = destination.Field(direct[position])
+			} else {
+				field = fieldForDecode(destination, fields[position].index)
+			}
+			if err := decoders[position](state, field, child, depth+1); err != nil {
+				return err
+			}
+			hint = position + 1
 		}
 		if info.required > 0 {
 			for position := range fields {
@@ -594,8 +792,7 @@ func newStructDecoder(kind reflect.Type) decoderFunc {
 }
 
 // generic converts an item to the natural Go representation used for any.
-func (state *decodeState) generic(index int) (any, error) {
-	value := &state.items[index]
+func (state *decodeState) generic(value *item, depth int) (any, error) {
 	switch value.major {
 	case 0:
 		return value.argument, nil
@@ -610,21 +807,27 @@ func (state *decodeState) generic(index int) (any, error) {
 		return string(state.payload(value)), nil
 	case 4:
 		values := make([]any, value.argument)
-		child := index + 1
+		var child item
 		for position := range values {
-			decoded, err := state.generic(child)
+			if err := state.item(&child, depth+1); err != nil {
+				return nil, err
+			}
+			decoded, err := state.generic(&child, depth+1)
 			if err != nil {
 				return nil, err
 			}
 			values[position] = decoded
-			child = int(state.items[child].next)
 		}
 		return values, nil
 	case 5:
 		values := make(map[any]any, value.argument)
-		child := index + 1
+		var key, child item
+		previous := -1
 		for range value.argument {
-			key := &state.items[child]
+			if err := state.readKey(&key, previous, depth+1); err != nil {
+				return nil, err
+			}
+			previous = key.start
 			switch {
 			case key.major == 2:
 				return nil, newError(ErrType, key.start, "byte-string map key cannot be represented in map[any]any")
@@ -632,21 +835,32 @@ func (state *decodeState) generic(index int) (any, error) {
 				// A *big.Int key would compare by pointer, not by value.
 				return nil, newError(ErrType, key.start, "integer map key below math.MinInt64 cannot be represented in map[any]any")
 			}
-			decodedKey, err := state.generic(child)
+			decodedKey, err := state.generic(&key, depth+1)
 			if err != nil {
 				return nil, err
 			}
-			entry := int(key.next)
-			decoded, err := state.generic(entry)
+			if err := state.item(&child, depth+1); err != nil {
+				return nil, err
+			}
+			decoded, err := state.generic(&child, depth+1)
 			if err != nil {
 				return nil, err
 			}
+			// Keys equal in the data model decode to equal Go values, so the
+			// map detects duplicates, as insert does for typed maps.
+			before := len(values)
 			values[decodedKey] = decoded
-			child = int(state.items[entry].next)
+			if len(values) == before {
+				return nil, newError(ErrInvalid, key.start, "duplicate map key")
+			}
 		}
 		return values, nil
 	case 6:
-		decoded, err := state.generic(index + 1)
+		var child item
+		if err := state.item(&child, depth+1); err != nil {
+			return nil, err
+		}
+		decoded, err := state.generic(&child, depth+1)
 		if err != nil {
 			return nil, err
 		}

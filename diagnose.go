@@ -32,25 +32,31 @@ func (options DecoderOptions) Diagnose(data []byte) (string, error) {
 	}
 	state := getState(&options)
 	defer putState(state)
-	parser := parser{input: data, options: options, items: state.items}
-	root, err := parser.parse(0)
-	state.items = parser.items
-	if err != nil {
+	state.setInput(data)
+	parser := &state.parser
+	var root item
+	if err := parser.skip(&root, 0); err != nil {
 		return "", err
 	}
-	if len(parser.data) != len(data) {
-		return "", newError(ErrMalformed, len(parser.data), "trailing data")
+	if parser.pos != len(data) {
+		return "", newError(ErrMalformed, parser.pos, "trailing data")
 	}
-	state.data = parser.data
+	// The item is valid, so a second read fails only on a reader error,
+	// which slices do not have.
+	parser.pos = 0
 	var builder strings.Builder
-	state.diagnose(&builder, root)
+	if err := parser.item(&root, 0); err != nil {
+		return "", err
+	}
+	if err := parser.diagnose(&builder, &root, 0); err != nil {
+		return "", err
+	}
 	return builder.String(), nil
 }
 
-// diagnose writes the notation of the item at index and returns the index
-// of its next sibling.
-func (state *decodeState) diagnose(builder *strings.Builder, index int) int {
-	value := &state.items[index]
+// diagnose writes the notation of an item read by item, reading its
+// children.
+func (parser *parser) diagnose(builder *strings.Builder, value *item, depth int) error {
 	var scratch [32]byte
 	switch value.major {
 	case 0:
@@ -64,32 +70,39 @@ func (state *decodeState) diagnose(builder *strings.Builder, index int) int {
 		}
 	case 2:
 		builder.WriteString("h'")
-		builder.WriteString(hex.EncodeToString(state.payload(value)))
+		builder.WriteString(hex.EncodeToString(parser.data[value.payload():value.end]))
 		builder.WriteByte('\'')
 	case 3:
-		quote(builder, state.payload(value))
+		quote(builder, parser.data[value.payload():value.end])
 	case 4, 5:
 		open, close := "[", "]"
 		if value.major == 5 {
 			open, close = "{", "}"
 		}
 		builder.WriteString(open)
-		child := index + 1
+		var child item
 		for position := range value.argument {
 			if position > 0 {
 				builder.WriteString(", ")
 			}
-			child = state.diagnose(builder, child)
+			if err := parser.diagnoseNext(builder, &child, depth+1); err != nil {
+				return err
+			}
 			if value.major == 5 {
 				builder.WriteString(": ")
-				child = state.diagnose(builder, child)
+				if err := parser.diagnoseNext(builder, &child, depth+1); err != nil {
+					return err
+				}
 			}
 		}
 		builder.WriteString(close)
 	case 6:
 		builder.Write(strconv.AppendUint(scratch[:0], value.argument, 10))
 		builder.WriteByte('(')
-		state.diagnose(builder, index+1)
+		var child item
+		if err := parser.diagnoseNext(builder, &child, depth+1); err != nil {
+			return err
+		}
 		builder.WriteByte(')')
 	default:
 		switch {
@@ -109,7 +122,15 @@ func (state *decodeState) diagnose(builder *strings.Builder, index int) int {
 			builder.WriteByte(')')
 		}
 	}
-	return int(value.next)
+	return nil
+}
+
+// diagnoseNext reads the next item and writes its notation.
+func (parser *parser) diagnoseNext(builder *strings.Builder, child *item, depth int) error {
+	if err := parser.item(child, depth); err != nil {
+		return err
+	}
+	return parser.diagnose(builder, child, depth)
 }
 
 // quote writes text as a JSON-style string literal, which RFC 8949 Section 8

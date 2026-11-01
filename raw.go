@@ -48,23 +48,21 @@ var rawDeterministicOptions = func() DecoderOptions {
 // nesting budget below depth and, when deterministic is set, that it is in
 // core deterministic encoding.
 func validateRaw(data []byte, depth int, deterministic bool) error {
-	options := rawOptions
+	options := &rawOptions
 	if deterministic {
-		options = rawDeterministicOptions
+		options = &rawDeterministicOptions
 	}
-	state := getState(&options)
-	defer putState(state)
-	parser := parser{input: data, options: options, items: state.items}
-	_, err := parser.parse(depth)
-	state.items = parser.items
-	if err != nil {
+	parser := parser{options: options}
+	parser.setInput(data)
+	var root item
+	if err := parser.skip(&root, depth); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
 		return err
 	}
-	if len(parser.data) != len(data) {
-		return newError(ErrMalformed, len(parser.data), "trailing raw data")
+	if parser.pos != len(data) {
+		return newError(ErrMalformed, parser.pos, "trailing raw data")
 	}
 	return nil
 }
