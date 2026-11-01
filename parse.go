@@ -214,6 +214,12 @@ func (parser *parser) itemSlow(result *item, depth int) error {
 		if count > uint64(parser.options.MaxEncodedBytes-parser.pos) {
 			return newError(ErrLimit, result.start, "container exceeds encoded size limit")
 		}
+		// Decoders allocate a container's elements before reading them, so
+		// in slice mode a count the remaining input cannot hold fails here,
+		// keeping every allocation proportional to bytes actually present.
+		if parser.reader == nil && count > uint64(len(parser.data)-parser.pos) {
+			return io.ErrUnexpectedEOF
+		}
 	case 6:
 		if parser.options.RejectTags {
 			return newError(ErrUnsupported, result.start, "tags rejected by decoder options")

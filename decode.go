@@ -28,12 +28,15 @@ type decodeState struct {
 
 // pendingOp is a deferred UnmarshalCBOR call on receiver, or when receiver
 // is nil, a deferred map insertion whose key or element awaits such a call.
+// A placed insertion overwrites a placeholder the pass already inserted to
+// detect duplicate Go keys.
 type pendingOp struct {
 	receiver   Unmarshaler
 	start, end int // the receiver's item, or the key's offset for errors
 	target     reflect.Value
 	key        reflect.Value
 	element    reflect.Value
+	placed     bool
 }
 
 var statePool = sync.Pool{New: func() any { return new(decodeState) }}
@@ -81,6 +84,10 @@ func (state *decodeState) flush() error {
 			if err := op.receiver.UnmarshalCBOR(state.data[op.start:op.end:op.end]); err != nil {
 				return err
 			}
+			continue
+		}
+		if op.placed {
+			op.target.SetMapIndex(op.key, op.element)
 			continue
 		}
 		if err := insert(op.target, op.key, op.element, op.start); err != nil {
@@ -590,7 +597,9 @@ func newMapDecoder(kind reflect.Type) decoderFunc {
 	interfaceKey := keyType.Kind() == reflect.Interface
 	// Entries whose key or element awaits an UnmarshalCBOR call are decoded
 	// into fresh values and inserted by flush, after that call has run.
-	deferInsert := deferred(keyType) || deferred(elementType)
+	deferredKey := deferred(keyType)
+	deferInsert := deferredKey || deferred(elementType)
+	zeroElement := reflect.Zero(elementType)
 	// Deferred insertions cannot detect duplicates until flush, after
 	// application code has run, so those maps track keys during the pass.
 	trackKeys := deferInsert || !valueKeys(keyType)
@@ -642,7 +651,15 @@ func newMapDecoder(kind reflect.Type) decoderFunc {
 			if err := decodeElement(state, element, child, depth+1); err != nil {
 				return err
 			}
-			if deferInsert {
+			if deferInsert && !deferredKey {
+				// The key is known now, so a duplicate Go key, such as 1 and
+				// 1.0 in a map[float64]T, is found before any queued call
+				// runs; flush replaces the placeholder with the element.
+				if err := insert(result, key, zeroElement, keyItem.start); err != nil {
+					return err
+				}
+				state.pending = append(state.pending, pendingOp{start: keyItem.start, target: result, key: key, element: element, placed: true})
+			} else if deferInsert {
 				state.pending = append(state.pending, pendingOp{start: keyItem.start, target: result, key: key, element: element})
 			} else if err := insert(result, key, element, keyItem.start); err != nil {
 				return err

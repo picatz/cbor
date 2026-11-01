@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -258,4 +259,82 @@ func FuzzDeferral(f *testing.F) {
 			}
 		}
 	})
+}
+
+// TestTruncatedContainerAllocation checks that a container count the
+// input cannot hold fails before its elements are allocated, in slice and
+// stream mode.
+func TestTruncatedContainerAllocation(t *testing.T) {
+	if runtime.GOARCH == "wasm" {
+		t.Skip("measures allocation")
+	}
+	measure := func(decode func() error) (uint64, error) {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		err := decode()
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc, err
+	}
+	for _, test := range []struct {
+		name string
+		data []byte
+		into func() any
+	}{
+		{"array of large elements", mustHex("992710"), func() any { return new([][1024]byte) }},
+		{"map of large elements", mustHex("b92710"), func() any { return new(map[string][128]byte) }},
+		{"nested arrays into any", bytes.Repeat(mustHex("992710"), 60), func() any { return new(any) }},
+		{"nested maps into any", bytes.Repeat(mustHex("b9271000"), 60), func() any { return new(any) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bytesUsed, err := measure(func() error { return cbor.Unmarshal(test.data, test.into()) })
+			if !errors.Is(err, io.ErrUnexpectedEOF) || bytesUsed > 64<<10 {
+				t.Errorf("Unmarshal: %v after allocating %d bytes", err, bytesUsed)
+			}
+			bytesUsed, err = measure(func() error {
+				return cbor.NewDecoder(bytes.NewReader(test.data)).Decode(test.into())
+			})
+			if !errors.Is(err, io.ErrUnexpectedEOF) || bytesUsed > 64<<10 {
+				t.Errorf("Decode: %v after allocating %d bytes", err, bytesUsed)
+			}
+		})
+	}
+}
+
+// TestCollidingGoKeysBeforeDeferredCalls checks that keys distinct in CBOR
+// but equal as Go keys are reported before any queued UnmarshalCBOR runs.
+func TestCollidingGoKeysBeforeDeferredCalls(t *testing.T) {
+	calls = nil
+	var floats map[float64]accepting
+	// {1: 0, 1.0: 0}
+	if err := cbor.Unmarshal(mustHex("a2"+"0100"+"f93c0000"), &floats); !errors.Is(err, cbor.ErrInvalid) || len(calls) != 0 || floats != nil {
+		t.Fatalf("map[float64]: %v, calls %q, map %v", err, calls, floats)
+	}
+	var narrow map[float32]*accepting
+	// {1.0 as binary32: 0, 1.00000001 as binary64: 0}, equal as float32
+	if err := cbor.Unmarshal(mustHex("a2"+"fa3f80000000"+"fb3ff0000002af31dc"+"00"), &narrow); !errors.Is(err, cbor.ErrInvalid) || len(calls) != 0 || narrow != nil {
+		t.Fatalf("map[float32]: %v, calls %q, map %v", err, calls, narrow)
+	}
+	// Distinct Go keys still decode, and each element's call runs.
+	if err := cbor.Unmarshal(mustHex("a2"+"0100"+"f93e0000"), &floats); err != nil || len(floats) != 2 || len(calls) != 2 {
+		t.Fatalf("valid map: %v, calls %q, map %v", err, calls, floats)
+	}
+}
+
+// TestUnmarshalerPanicResetsDestination checks that a panicking
+// UnmarshalCBOR leaves no partly decoded zero destination behind.
+func TestUnmarshalerPanicResetsDestination(t *testing.T) {
+	type target struct {
+		A int       `cbor:"A"`
+		B panicking `cbor:"B"`
+		C []int     `cbor:"C"`
+	}
+	var value target
+	func() {
+		defer func() { recover() }()
+		_ = cbor.Unmarshal(mustHex("a3"+"614105"+"61438101"+"614200"), &value)
+	}()
+	if !reflect.DeepEqual(value, target{}) {
+		t.Fatalf("destination after panic = %+v, want zero", value)
+	}
 }

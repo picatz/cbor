@@ -193,8 +193,16 @@ func (decoder *Decoder) Decode(destination any) error {
 	}
 	state := getState(&options)
 	defer putState(state)
+	// A stream's remaining length is unknown, so read and validate the whole
+	// item before decoding it from the buffer; allocations sized from its
+	// counts are then bounded by bytes actually received.
 	state.reader, state.data = decoder.reader, decoder.buffer[:0]
-	err = store(target, state)
+	var whole item
+	if err = state.skip(&whole, 0); err == nil {
+		state.reader = nil
+		state.setInput(state.data)
+		err = store(target, state)
+	}
 	if cap(state.data) <= maxRetainedBuffer {
 		decoder.buffer = state.data
 	}
@@ -246,6 +254,15 @@ func store(target reflect.Value, state *decodeState) error {
 	replacement := destination
 	if !inPlace {
 		replacement = reflect.New(destination.Type()).Elem()
+	}
+	if inPlace {
+		// A panicking UnmarshalCBOR must not leave a partly decoded value.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				destination.SetZero()
+				panic(recovered)
+			}
+		}()
 	}
 	err := func() error {
 		var root item
