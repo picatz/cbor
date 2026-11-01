@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -71,6 +72,15 @@ func compare(t *testing.T, data []byte) {
 	if err != nil {
 		t.Fatalf("%x: Diagnose: %v", data, err)
 	}
+	notation, err := cbor.Diagnose(data)
+	switch {
+	case err != nil:
+		t.Fatalf("%x: accepted by Unmarshal, rejected by Diagnose: %v", data, err)
+	case notation != want && !strings.Contains(want, `\u`) && !bignumTag.MatchString(notation):
+		// The reference escapes non-ASCII text and interprets bignum
+		// tags; otherwise the notations agree.
+		t.Fatalf("%x: Diagnose = %s, reference %s", data, notation, want)
+	}
 	var decoded any
 	if err := cbor.Unmarshal(data, &decoded); errors.Is(err, cbor.ErrType) {
 		return // e.g. byte-string keys, which map[any]any cannot hold
@@ -91,6 +101,9 @@ func compare(t *testing.T, data []byte) {
 		}
 	}
 }
+
+// bignumTag matches tags 2 and 3 around a byte string in diagnostic notation.
+var bignumTag = regexp.MustCompile(`(^|[^0-9])[23]\(h'`)
 
 func tagSemantics(err error) bool {
 	message := err.Error()

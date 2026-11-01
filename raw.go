@@ -6,6 +6,7 @@ import (
 )
 
 // RawMessage retains one encoded CBOR item, including its original header.
+// It supports delayed decoding and embedding pre-encoded items.
 type RawMessage []byte
 
 // MarshalCBOR returns a validated encoding. A nil RawMessage encodes as null.
@@ -13,7 +14,7 @@ func (message RawMessage) MarshalCBOR() ([]byte, error) {
 	if message == nil {
 		return []byte{0xf6}, nil
 	}
-	if err := validateRawAtDepth(message, 0, false); err != nil {
+	if err := validateRaw(message, 0, false); err != nil {
 		return nil, err
 	}
 	return message, nil
@@ -36,18 +37,27 @@ var rawOptions = DecoderOptions{
 	MaxNestedLevels: maxEncodedDepth, MaxEncodedBytes: maxEncodedItem,
 }
 
-// validateRawAtDepth checks that data is exactly one item that fits in the
-// remaining nesting budget and, when deterministic is set, that it is in core
-// deterministic encoding.
-func validateRawAtDepth(data []byte, depth int, deterministic bool) error {
+// rawDeterministicOptions additionally requires core deterministic encoding.
+var rawDeterministicOptions = func() DecoderOptions {
 	options := rawOptions
-	options.RequireDeterministic = deterministic
-	options, err := options.normalized()
-	if err != nil {
-		return err
+	options.RequireDeterministic, options.RejectNonMinimal = true, true
+	return options
+}()
+
+// validateRaw checks that data is exactly one item that fits in the remaining
+// nesting budget below depth and, when deterministic is set, that it is in
+// core deterministic encoding.
+func validateRaw(data []byte, depth int, deterministic bool) error {
+	options := rawOptions
+	if deterministic {
+		options = rawDeterministicOptions
 	}
-	parser := parser{input: data, options: options}
-	if _, err := parser.item(depth); err != nil {
+	state := getState(&options)
+	defer putState(state)
+	parser := parser{input: data, options: options, items: state.items}
+	_, err := parser.parse(depth)
+	state.items = parser.items
+	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}

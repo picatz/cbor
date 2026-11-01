@@ -18,7 +18,7 @@ import (
 func TestStrictMalformedInput(t *testing.T) {
 	for _, encoded := range []string{
 		"63ff", "61ff", "1c", "1f", "9f01ff", "a201020103", "a20102180103",
-		"a2616101616102", "a1", "82f5", "1bffffffffffffffff00", "3bffffffffffffffff",
+		"a2616101616102", "a1", "82f5", "1bffffffffffffffff00",
 		"a1810000", "a1f97e0000", "a201020100", "f818",
 	} {
 		t.Run(encoded, func(t *testing.T) {

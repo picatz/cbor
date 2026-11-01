@@ -17,7 +17,9 @@ type Tag[T any] struct {
 
 // tagEncoder and tagDecoder let the reflection-based encoder and decoder
 // handle every instantiation of Tag.
-type tagEncoder interface{ cborTag() (uint64, reflect.Value) }
+type tagEncoder interface {
+	cborTag() (uint64, reflect.Value)
+}
 
 type tagDecoder interface {
 	cborTagTarget(number uint64) reflect.Value
