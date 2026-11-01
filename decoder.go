@@ -89,19 +89,6 @@ type DecoderOptions struct {
 	RequireDeterministic bool
 }
 
-// DefaultDecoderOptions is copied when Unmarshal runs or a decoder is
-// constructed.
-//
-// Deprecated: Mutating a global changes every caller of Unmarshal and
-// NewDecoder in the process and races with concurrent decoding. Use a
-// DecoderOptions value with its Unmarshal method or NewDecoderWithOptions;
-// the zero DecoderOptions selects the same defaults.
-var DefaultDecoderOptions = DecoderOptions{
-	MaxArrayElements: DefaultMaxValue, MaxMapPairs: DefaultMaxValue,
-	MaxStringBytes: DefaultMaxValue, MaxBytes: DefaultMaxValue,
-	MaxNestedLevels: DefaultMaxNestedLevels, MaxEncodedBytes: DefaultMaxEncodedBytes,
-}
-
 // Decoder reads one definite-length CBOR item at a time without read-ahead.
 // A decoder is not safe for concurrent use. After a decoding error, its stream
 // position is unspecified. Successful decoding replaces the destination value.
@@ -118,45 +105,13 @@ type Decoder struct {
 // maxRetainedBuffer bounds the storage a Decoder keeps after a large item.
 const maxRetainedBuffer = 64 << 10
 
-// NewDecoder constructs a decoder with a snapshot of DefaultDecoderOptions.
-func NewDecoder(reader io.Reader) *Decoder {
-	return &Decoder{reader: reader, options: DefaultDecoderOptions}
-}
+// NewDecoder constructs a decoder with the default options.
+func NewDecoder(reader io.Reader) *Decoder { return &Decoder{reader: reader} }
 
 // NewDecoderWithOptions constructs a decoder with independent limits.
 func NewDecoderWithOptions(reader io.Reader, options DecoderOptions) *Decoder {
 	return &Decoder{reader: reader, options: options}
 }
-
-// SetMax sets the four per-container and string limits for this decoder only.
-//
-// Deprecated: Use NewDecoderWithOptions.
-func (decoder *Decoder) SetMax(limit int) {
-	decoder.options.MaxArrayElements = limit
-	decoder.options.MaxMapPairs = limit
-	decoder.options.MaxStringBytes = limit
-	decoder.options.MaxBytes = limit
-}
-
-// SetMaxArrayElements sets the array element limit.
-//
-// Deprecated: Use NewDecoderWithOptions.
-func (decoder *Decoder) SetMaxArrayElements(limit int) { decoder.options.MaxArrayElements = limit }
-
-// SetMaxMapPairs sets the map pair limit.
-//
-// Deprecated: Use NewDecoderWithOptions.
-func (decoder *Decoder) SetMaxMapPairs(limit int) { decoder.options.MaxMapPairs = limit }
-
-// SetMaxStringBytes sets the text string byte limit.
-//
-// Deprecated: Use NewDecoderWithOptions.
-func (decoder *Decoder) SetMaxStringBytes(limit int) { decoder.options.MaxStringBytes = limit }
-
-// SetMaxBytes sets the byte string length limit.
-//
-// Deprecated: Use NewDecoderWithOptions.
-func (decoder *Decoder) SetMaxBytes(limit int) { decoder.options.MaxBytes = limit }
 
 func (options DecoderOptions) normalized() (DecoderOptions, error) {
 	for _, limit := range [...]*int{&options.MaxArrayElements, &options.MaxMapPairs, &options.MaxStringBytes, &options.MaxBytes} {
@@ -182,11 +137,12 @@ func (options DecoderOptions) normalized() (DecoderOptions, error) {
 	return options, nil
 }
 
-// Unmarshal decodes exactly one item and rejects trailing data. The destination
+// Unmarshal decodes exactly one item with the default options and rejects
+// trailing data. The destination
 // is unchanged on malformed input or a type error, except for side effects of
 // application-provided UnmarshalCBOR methods.
 func Unmarshal(data []byte, destination any) error {
-	return DefaultDecoderOptions.Unmarshal(data, destination)
+	return DecoderOptions{}.Unmarshal(data, destination)
 }
 
 // Unmarshal decodes exactly one item using these options.

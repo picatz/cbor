@@ -29,8 +29,8 @@ func (message *RawMessage) UnmarshalCBOR(data []byte) error {
 	return nil
 }
 
-// rawOptions validates embedded raw items and encoded map keys. It is fixed so
-// that encoding never depends on the mutable DefaultDecoderOptions.
+// rawOptions validates embedded raw items and encoded map keys with limits
+// matching the encoder's own.
 var rawOptions = DecoderOptions{
 	MaxArrayElements: DefaultMaxValue, MaxMapPairs: DefaultMaxValue,
 	MaxStringBytes: maxEncodedItem, MaxBytes: maxEncodedItem,

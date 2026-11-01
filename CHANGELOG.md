@@ -6,6 +6,23 @@ minor versions may change behavior; such changes are listed under
 
 ## Unreleased
 
+### Removed
+
+- `DefaultDecoderOptions`, a mutable global that raced with concurrent
+  decoding. `Unmarshal` and `NewDecoder` use the defaults; replace
+  `DefaultDecoderOptions.Unmarshal(data, v)` with
+  `cbor.DecoderOptions{...}.Unmarshal(data, v)` for other limits.
+- `Decoder.SetMax`, `SetMaxArrayElements`, `SetMaxMapPairs`,
+  `SetMaxStringBytes` and `SetMaxBytes`. Replace
+  `d := cbor.NewDecoder(r); d.SetMaxBytes(n)` with
+  `d := cbor.NewDecoderWithOptions(r, cbor.DecoderOptions{MaxBytes: n})`.
+
+These were deprecated for one revision and cannot be migrated by `go fix`:
+neither a mutable variable nor a setter of unexported fields has a
+single-expression replacement for its inliner.
+
+## Previous revision
+
 ### Added
 
 - Struct-wide integer keys: a blank field ``_ struct{} `cbor:",keyasint"` ``
@@ -63,5 +80,3 @@ minor versions may change behavior; such changes are listed under
   `MarshalOptions`, rather than compiled `DecMode`/`EncMode` objects: the
   per-type work is already cached, so a mode object would add API without
   saving time.
-- v1 should remove the deprecated global and setters, leaving `Unmarshal`
-  and `NewDecoder` with the zero-value defaults.
