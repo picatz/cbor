@@ -514,29 +514,42 @@ func newStructEncoder(kind reflect.Type) encoderFunc {
 	}
 	return func(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
 		order := info.order[state.options.Sort]
-		count := len(fields)
-		if optional {
-			count = 0
+		if !optional {
+			output = appendHeader(output, 5, uint64(len(fields)))
 			for _, position := range order {
-				if field, ok := fieldByIndex(value, fields[position].index); ok && !fields[position].omit(field) {
-					count++
+				output = append(output, fields[position].encodedKey...)
+				var err error
+				if output, err = state.child(encoders[position], output, value.Field(fields[position].index[0]), depth+1); err != nil {
+					return nil, err
 				}
 			}
+			return output, nil
 		}
-		output = appendHeader(output, 5, uint64(count))
+		// Select the present fields in one pass, on the stack for typical
+		// structs, so each field is located and tested once.
+		var buffer [24]presentField
+		present := buffer[:0]
 		for _, position := range order {
-			field, ok := fieldByIndex(value, fields[position].index)
-			if !ok || optional && fields[position].omit(field) {
-				continue
+			if field, ok := fieldByIndex(value, fields[position].index); ok && !fields[position].omit(field) {
+				present = append(present, presentField{position: position, value: field})
 			}
-			output = append(output, fields[position].encodedKey...)
+		}
+		output = appendHeader(output, 5, uint64(len(present)))
+		for _, entry := range present {
+			output = append(output, fields[entry.position].encodedKey...)
 			var err error
-			if output, err = state.child(encoders[position], output, field, depth+1); err != nil {
+			if output, err = state.child(encoders[entry.position], output, entry.value, depth+1); err != nil {
 				return nil, err
 			}
 		}
 		return output, nil
 	}
+}
+
+// presentField is a struct field selected for encoding.
+type presentField struct {
+	position int
+	value    reflect.Value
 }
 
 // uniqueKeys reports whether distinct Go keys of this type always have
