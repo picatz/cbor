@@ -6,36 +6,13 @@ minor versions may change behavior; such changes are listed under
 
 ## Unreleased
 
-### Removed
-
-- `DefaultDecoderOptions`, a mutable global that raced with concurrent
-  decoding. `Unmarshal` and `NewDecoder` use the defaults; replace
-  `DefaultDecoderOptions.Unmarshal(data, v)` with
-  `cbor.DecoderOptions{...}.Unmarshal(data, v)` for other limits.
-- `Decoder.SetMax`, `SetMaxArrayElements`, `SetMaxMapPairs`,
-  `SetMaxStringBytes` and `SetMaxBytes`. Replace
-  `d := cbor.NewDecoder(r); d.SetMaxBytes(n)` with
-  `d := cbor.NewDecoderWithOptions(r, cbor.DecoderOptions{MaxBytes: n})`.
-
-These were deprecated for one revision and cannot be migrated by `go fix`:
-neither a mutable variable nor a setter of unexported fields has a
-single-expression replacement for its inliner.
-
-### Changed
-
-- Decoding allocates at most about 50 bytes per input byte for the densest
-  adversarial input (one-byte items), down from about 214 (and 182 before
-  the codec rebuild): parse-arena items shrink from 40 to 24 bytes, and the
-  arena doubles instead of growing by append's 1.25 factor, bounded by what
-  the remaining input could hold.
-- `MaxEncodedBytes` above `math.MaxInt32` is an invalid option.
-
-## Previous revision
+Changes since `f5df8ee`, the last revision before
+[#12](https://github.com/picatz/cbor/pull/12).
 
 ### Added
 
 - Struct-wide integer keys: a blank field ``_ struct{} `cbor:",keyasint"` ``
-  makes every field name an integer key.
+  makes every field name an integer key, as COSE and CWT use.
 - The `required` field option fails decoding with `ErrType` when the key is
   absent. With `RejectUnknownFields` and `RequireDeterministic` it accepts
   exactly one encoding of a message.
@@ -47,12 +24,9 @@ single-expression replacement for its inliner.
   diagnostic notation.
 - `Decoder.All` iterates an RFC 8742 CBOR sequence.
 - `AppendMarshal` and `EncoderOptions.AppendMarshal` append to a caller's
-  buffer.
+  buffer; a struct encodes without allocating.
 - Constants `DefaultMaxNestedLevels`, `DefaultMaxEncodedBytes` and
   `MaxNestedLevelsLimit` name the documented limits.
-- Fuzzers `FuzzDiagnose` and `FuzzSchema`; a nightly fuzzing workflow;
-  `govulncheck`; actions pinned to commit SHAs; Dependabot.
-- Side-by-side benchmarks against fxamacker/cbor in the `interop` module.
 
 ### Changed
 
@@ -71,21 +45,48 @@ single-expression replacement for its inliner.
   `ErrType`, because a `*big.Int` key would compare by pointer.
 - Type error messages name the item and destination, such as `cannot decode
   text string into int` or `negative integer overflows uint8`.
+- `MaxEncodedBytes` above `math.MaxInt32` is an invalid option.
 - Decoding and encoding are rebuilt on a pooled parse arena and per-type
   compiled codecs: about 40% less time, 69% fewer bytes and 46% fewer
   allocations across the package benchmarks.
+- The densest adversarial input, one-byte items, allocates about 50 bytes
+  per input byte instead of about 182: arena items take 24 bytes, and the
+  arena doubles, bounded by what the remaining input could hold.
 
-### Deprecated
+### Removed
 
-- `DefaultDecoderOptions`: a mutable global races with concurrent decoding.
-  Use a `DecoderOptions` value; its zero value selects the same defaults.
+- `DefaultDecoderOptions`, a mutable global that raced with concurrent
+  decoding. `Unmarshal` and `NewDecoder` use the defaults; replace
+  `cbor.DefaultDecoderOptions.Unmarshal(data, v)` with
+  `cbor.DecoderOptions{...}.Unmarshal(data, v)` for other limits.
 - `Decoder.SetMax`, `SetMaxArrayElements`, `SetMaxMapPairs`,
-  `SetMaxStringBytes` and `SetMaxBytes`: use `NewDecoderWithOptions`.
+  `SetMaxStringBytes` and `SetMaxBytes`. Replace
+  `d := cbor.NewDecoder(r); d.SetMaxBytes(n)` with
+  `d := cbor.NewDecoderWithOptions(r, cbor.DecoderOptions{MaxBytes: n})`.
 
-### Notes toward v1
+`go fix` cannot make these replacements: its inliner needs a function or
+constant whose body can stand in for the call, and neither a mutable
+variable nor a setter of unexported fields has one.
+
+### Testing and CI
+
+- Every message in the public-domain cose-wg/Examples corpus is checked, and
+  the `interop` module compares it, and diagnostic notation, against
+  fxamacker/cbor.
+- New fuzzers `FuzzDiagnose`, `FuzzSchema` and `FuzzCOSE`, and every fuzzer
+  runs for ten minutes nightly.
+- Actions are pinned to commit SHAs and updated by Dependabot, and
+  `govulncheck` runs on both modules.
+- Side-by-side benchmarks against fxamacker/cbor live in the `interop`
+  module.
+
+### Design notes toward v1
 
 - Options stay plain values with methods (`DecoderOptions.Unmarshal`,
   `EncoderOptions.Marshal`), like protobuf's `UnmarshalOptions` and
   `MarshalOptions`, rather than compiled `DecMode`/`EncMode` objects: the
   per-type work is already cached, so a mode object would add API without
   saving time.
+- SIMD and assembly are deferred: profiles put decoding cost in parsing,
+  reflection and allocation, and Go's `simd/archsimd` is still experimental
+  ([#7](https://github.com/picatz/cbor/issues/7)).
