@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -184,7 +185,39 @@ func TestDifferentialVectors(t *testing.T) {
 	}
 }
 
+// TestDifferentialCOSE runs the cose-wg/Examples corpus through compare.
+func TestDifferentialCOSE(t *testing.T) {
+	for _, data := range coseCorpus(t) {
+		compare(t, data)
+	}
+}
+
+// coseCorpus reads the main module's copy of cose-wg/Examples.
+func coseCorpus(t testing.TB) [][]byte {
+	t.Helper()
+	text, err := os.ReadFile("../testdata/cose-wg/vectors.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus [][]byte
+	for line := range strings.Lines(string(text)) {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		data, err := hex.DecodeString(fields[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		corpus = append(corpus, data)
+	}
+	return corpus
+}
+
 func FuzzDifferential(f *testing.F) {
+	for _, data := range coseCorpus(f) {
+		f.Add(data)
+	}
 	for _, vectors := range [][]string{appendixA, extra} {
 		for _, encoded := range vectors {
 			data, _ := hex.DecodeString(encoded)
