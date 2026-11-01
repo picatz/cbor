@@ -70,8 +70,8 @@ err := options.Unmarshal(data, &fields)
 
 Zero limits select defaults: 10,000 array elements, map pairs, text bytes and
 byte-string bytes; 64 nesting levels; and 1 MiB encoded input. The maximum
-configurable nesting limit is 256. The mutable `DefaultDecoderOptions` global
-and the `Decoder.SetMax*` setters are deprecated.
+configurable nesting limit is 256. `Unmarshal` and `NewDecoder` use the
+defaults; `NewDecoderWithOptions` gives a stream decoder its own options.
 
 Every failure other than I/O and end-of-input is a `*cbor.Error` with a byte
 offset, classified for `errors.Is`:

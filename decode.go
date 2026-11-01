@@ -407,7 +407,7 @@ func newSliceDecoder(kind reflect.Type) decoderFunc {
 			if err := element(state, slice.Index(position), child); err != nil {
 				return err
 			}
-			child = state.items[child].next
+			child = int(state.items[child].next)
 		}
 		destination.Set(slice)
 		return nil
@@ -432,7 +432,7 @@ func newArrayDecoder(kind reflect.Type) decoderFunc {
 			if err := element(state, destination.Index(position), child); err != nil {
 				return err
 			}
-			child = state.items[child].next
+			child = int(state.items[child].next)
 		}
 		return nil
 	}
@@ -466,7 +466,7 @@ func newMapDecoder(kind reflect.Type) decoderFunc {
 			if interfaceKey && !key.IsNil() && !key.Elem().Type().Comparable() {
 				return newError(ErrType, state.items[child].start, "map key cannot be represented in Go")
 			}
-			entry := state.items[child].next
+			entry := int(state.items[child].next)
 			element.SetZero()
 			if err := decodeElement(state, element, entry); err != nil {
 				return err
@@ -478,7 +478,7 @@ func newMapDecoder(kind reflect.Type) decoderFunc {
 			if result.Len() == before {
 				return newError(ErrInvalid, state.items[child].start, "duplicate destination map key")
 			}
-			child = state.items[entry].next
+			child = int(state.items[entry].next)
 		}
 		destination.Set(result)
 		return nil
@@ -546,7 +546,7 @@ func newStructDecoder(kind reflect.Type) decoderFunc {
 				if err := decoders[position](state, fieldForDecode(destination, fields[position].index), child); err != nil {
 					return err
 				}
-				child = state.items[child].next
+				child = int(state.items[child].next)
 			}
 			return nil
 		}
@@ -561,7 +561,7 @@ func newStructDecoder(kind reflect.Type) decoderFunc {
 		child := index + 1
 		for range value.argument {
 			key := &state.items[child]
-			entry := key.next
+			entry := int(key.next)
 			position := info.lookup(state.data, key, hint)
 			if position < 0 {
 				if state.rejectUnknown {
@@ -580,7 +580,7 @@ func newStructDecoder(kind reflect.Type) decoderFunc {
 				}
 				hint = position + 1
 			}
-			child = state.items[entry].next
+			child = int(state.items[entry].next)
 		}
 		if info.required > 0 {
 			for position := range fields {
@@ -617,7 +617,7 @@ func (state *decodeState) generic(index int) (any, error) {
 				return nil, err
 			}
 			values[position] = decoded
-			child = state.items[child].next
+			child = int(state.items[child].next)
 		}
 		return values, nil
 	case 5:
@@ -636,13 +636,13 @@ func (state *decodeState) generic(index int) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			entry := key.next
+			entry := int(key.next)
 			decoded, err := state.generic(entry)
 			if err != nil {
 				return nil, err
 			}
 			values[decodedKey] = decoded
-			child = state.items[entry].next
+			child = int(state.items[entry].next)
 		}
 		return values, nil
 	case 6:

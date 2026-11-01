@@ -6,6 +6,32 @@ minor versions may change behavior; such changes are listed under
 
 ## Unreleased
 
+### Removed
+
+- `DefaultDecoderOptions`, a mutable global that raced with concurrent
+  decoding. `Unmarshal` and `NewDecoder` use the defaults; replace
+  `DefaultDecoderOptions.Unmarshal(data, v)` with
+  `cbor.DecoderOptions{...}.Unmarshal(data, v)` for other limits.
+- `Decoder.SetMax`, `SetMaxArrayElements`, `SetMaxMapPairs`,
+  `SetMaxStringBytes` and `SetMaxBytes`. Replace
+  `d := cbor.NewDecoder(r); d.SetMaxBytes(n)` with
+  `d := cbor.NewDecoderWithOptions(r, cbor.DecoderOptions{MaxBytes: n})`.
+
+These were deprecated for one revision and cannot be migrated by `go fix`:
+neither a mutable variable nor a setter of unexported fields has a
+single-expression replacement for its inliner.
+
+### Changed
+
+- Decoding allocates at most about 50 bytes per input byte for the densest
+  adversarial input (one-byte items), down from about 214 (and 182 before
+  the codec rebuild): parse-arena items shrink from 40 to 24 bytes, and the
+  arena doubles instead of growing by append's 1.25 factor, bounded by what
+  the remaining input could hold.
+- `MaxEncodedBytes` above `math.MaxInt32` is an invalid option.
+
+## Previous revision
+
 ### Added
 
 - Struct-wide integer keys: a blank field ``_ struct{} `cbor:",keyasint"` ``
@@ -63,5 +89,3 @@ minor versions may change behavior; such changes are listed under
   `MarshalOptions`, rather than compiled `DecMode`/`EncMode` objects: the
   per-type work is already cached, so a mode object would add API without
   saving time.
-- v1 should remove the deprecated global and setters, leaving `Unmarshal`
-  and `NewDecoder` with the zero-value defaults.

@@ -109,7 +109,7 @@ func (state *decodeState) diagnose(builder *strings.Builder, index int) int {
 			builder.WriteByte(')')
 		}
 	}
-	return value.next
+	return int(value.next)
 }
 
 // quote writes text as a JSON-style string literal, which RFC 8949 Section 8

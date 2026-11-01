@@ -138,9 +138,8 @@ func TestDecoderLimitsAndIsolation(t *testing.T) {
 			t.Fatalf("limit ignored: %+v %x", test.options, test.data)
 		}
 	}
-	first := cbor.NewDecoder(bytes.NewReader([]byte{0x82, 0, 0}))
+	first := cbor.NewDecoderWithOptions(bytes.NewReader([]byte{0x82, 0, 0}), cbor.DecoderOptions{MaxArrayElements: 1})
 	second := cbor.NewDecoder(bytes.NewReader([]byte{0x82, 0, 0}))
-	first.SetMaxArrayElements(1)
 	var values []uint64
 	if first.Decode(&values) == nil {
 		t.Fatal("first limit ignored")
