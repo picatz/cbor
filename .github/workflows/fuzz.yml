@@ -28,6 +28,7 @@ jobs:
           - {dir: ., target: FuzzSchema}
           - {dir: ., target: FuzzCOSE}
           - {dir: ., target: FuzzDeferral}
+          - {dir: ., target: FuzzValidText}
           - {dir: ., target: FuzzBytewiseMatchesCTAP2}
           - {dir: interop, target: FuzzDifferential}
     steps:

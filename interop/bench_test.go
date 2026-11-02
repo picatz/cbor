@@ -40,6 +40,24 @@ type coseKey struct {
 	Y   []byte `cbor:"-3,keyasint"`
 }
 
+// registration is shaped like a WebAuthn registration's text fields: a
+// relying party and user entity with 15-60 byte strings, one non-ASCII.
+type registration struct {
+	RPID        string `cbor:"rpId"`
+	RPName      string `cbor:"rpName"`
+	UserName    string `cbor:"userName"`
+	DisplayName string `cbor:"displayName"`
+	Origin      string `cbor:"origin"`
+}
+
+var webauthn = registration{
+	RPID:        "login.example.com",
+	RPName:      "Example Corporation Sign-In Service",
+	UserName:    "alice.johnson@example.com",
+	DisplayName: "Alice Johnson — Platform Engineering",
+	Origin:      "https://login.example.com/webauthn/register?flow=passkey",
+}
+
 var key = coseKey{Kty: 2, Kid: []byte("11"), Alg: -7, Crv: 1, X: bytes.Repeat([]byte{0xba}, 32), Y: bytes.Repeat([]byte{0xbe}, 32)}
 
 var getInfo = map[uint64]any{
@@ -128,6 +146,7 @@ func BenchmarkMarshal(b *testing.B) {
 		{"CWTClaims", decodedClaims},
 		{"COSEKey", key},
 		{"GetInfoAny", getInfo},
+		{"WebAuthnText", webauthn},
 		{"MapStringBool", map[string]bool{"rk": true, "up": true, "uv": false, "plat": false, "clientPin": true}},
 	}
 	for _, c := range cases {

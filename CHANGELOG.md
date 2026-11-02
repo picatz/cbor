@@ -57,6 +57,9 @@ Changes since `f5df8ee`, the last revision before
 - Encoding a struct with omitted fields writes it in one pass, and
   encoding a reflected map reuses its iteration values, so every encoding
   allocates only its result.
+- Text strings are checked for valid UTF-8 eight bytes at a time before
+  falling back to `unicode/utf8`, so encoding text-heavy structs is about
+  12% faster; invalid UTF-8 still fails with `ErrInvalid`.
 - The densest adversarial input, one-byte items, allocates about one byte
   per input byte instead of about 182.
 
