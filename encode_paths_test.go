@@ -1,10 +1,13 @@
 package cbor_test
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/picatz/cbor"
 )
@@ -82,4 +85,100 @@ func TestMapIterationValuesAcrossTypes(t *testing.T) {
 	if notation, _ = cbor.Diagnose(encoded); notation != `{"ok": "yes"}` {
 		t.Fatalf("after a failure, encoded %s", notation)
 	}
+}
+
+// pointerZero reports zero only through a pointer receiver.
+type pointerZero struct{ n int }
+
+func (value *pointerZero) IsZero() bool { return value.n == 0 || value.n == 42 }
+
+// TestOmitZeroMethods checks omitzero for value-receiver and
+// pointer-receiver IsZero methods, nil pointers and interfaces, and fields
+// reached with and without an addressable struct.
+func TestOmitZeroMethods(t *testing.T) {
+	type fields struct {
+		When    time.Time    `cbor:"1,keyasint,omitzero"`
+		Pointer pointerZero  `cbor:"2,keyasint,omitzero"`
+		Nil     *time.Time   `cbor:"3,keyasint,omitzero"`
+		Iface   fmt.Stringer `cbor:"4,keyasint,omitzero"`
+		Count   int          `cbor:"5,keyasint,omitzero"`
+	}
+	// pointerZero{n: 42} is zero by its method, but only an addressable
+	// field can call it; otherwise its Go zero value decides.
+	value := fields{Pointer: pointerZero{n: 42}, Count: 1}
+	addressable, err := cbor.Marshal(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notation, _ := cbor.Diagnose(addressable); notation != "{5: 1}" {
+		t.Fatalf("through a pointer: %s", notation)
+	}
+	copied, err := cbor.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notation, _ := cbor.Diagnose(copied); notation != "{2: {}, 5: 1}" {
+		t.Fatalf("by value: %s", notation)
+	}
+	// A time that is not zero is kept, by value and through a pointer.
+	value.When = time.Unix(1, 0)
+	for _, encode := range []any{value, &value} {
+		encoded, err := cbor.Marshal(encode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var keys map[int]cbor.RawMessage
+		if err := cbor.Unmarshal(encoded, &keys); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := keys[1]; !ok {
+			t.Fatalf("non-zero time omitted: %x", encoded)
+		}
+	}
+}
+
+// TestConcurrentMixedTypes checks that the per-state codec caches stay
+// correct when goroutines interleave many types; run it with -race.
+func TestConcurrentMixedTypes(t *testing.T) {
+	type small struct {
+		A int `cbor:"1,keyasint"`
+	}
+	type text struct {
+		Name string `cbor:"name"`
+	}
+	values := []any{
+		small{A: 1}, &small{A: 2}, text{Name: "x"}, map[string]int{"k": 3},
+		[]string{"a", "b"}, uint64(7), map[int]small{1: {A: 4}}, []any{small{A: 5}, "y"},
+	}
+	encodings := make([][]byte, len(values))
+	for index, value := range values {
+		encoded, err := cbor.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encodings[index] = encoded
+	}
+	var group sync.WaitGroup
+	for worker := range 16 {
+		group.Go(func() {
+			for round := range 200 {
+				index := (worker + round) % len(values)
+				encoded, err := cbor.Marshal(values[index])
+				if err != nil || !bytes.Equal(encoded, encodings[index]) {
+					t.Errorf("Marshal(%#v) = %x, %v; want %x", values[index], encoded, err, encodings[index])
+					return
+				}
+				decoded := reflect.New(reflect.TypeOf(values[index]))
+				if err := cbor.Unmarshal(encoded, decoded.Interface()); err != nil {
+					t.Errorf("Unmarshal into %T: %v", values[index], err)
+					return
+				}
+				if again, err := cbor.Marshal(decoded.Elem().Interface()); err != nil || !bytes.Equal(again, encoded) {
+					t.Errorf("%T round trip = %x, %v; want %x", values[index], again, err, encoded)
+					return
+				}
+			}
+		})
+	}
+	group.Wait()
 }

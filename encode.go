@@ -41,6 +41,11 @@ type encodeState struct {
 	scratch [][]byte
 	spans   [][]span
 
+	// lastKind and lastEncode remember the type this pooled state encoded
+	// last through reflection, so repeated encodes skip the shared cache.
+	lastKind   reflect.Type
+	lastEncode encoderFunc
+
 	// iterated holds, per depth, the key and element values a reflected
 	// map is iterated into, so encoding a map allocates neither.
 	iterated []iteratedEntry
@@ -120,40 +125,64 @@ func (state *encodeState) child(encode encoderFunc, output []byte, value reflect
 	return encode(state, output, value, depth)
 }
 
-// encoderCache maps a reflect.Type to its encoderFunc.
+// typeEncoder is a cache entry: a type and its encoder.
+type typeEncoder struct {
+	kind        reflect.Type
+	encode      encoderFunc
+	placeholder bool // encode waits for the type's encoder to be built
+}
+
+// encoderCache maps a reflect.Type to its *typeEncoder.
 var encoderCache sync.Map
 
-// encoderFor returns the encoder for a type, building it once. Recursive
-// types receive an indirect encoder while their own is under construction.
-func encoderFor(kind reflect.Type) encoderFunc {
+// encoderFor returns the encoder for a type, building it once.
+func encoderFor(kind reflect.Type) encoderFunc { return encoderEntry(kind).encode }
+
+// encoderFor returns the encoder for kind through the state's one-entry
+// cache, which repeated encodes of one type hit without hashing.
+func (state *encodeState) encoderFor(kind reflect.Type) encoderFunc {
+	if kind == state.lastKind {
+		return state.lastEncode
+	}
+	entry := encoderEntry(kind)
+	if !entry.placeholder {
+		state.lastKind, state.lastEncode = kind, entry.encode
+	}
+	return entry.encode
+}
+
+// encoderEntry returns the cache entry for a type, building its encoder
+// once. Recursive types receive a placeholder entry while their own is under
+// construction.
+func encoderEntry(kind reflect.Type) *typeEncoder {
 	if cached, ok := encoderCache.Load(kind); ok {
-		return cached.(encoderFunc)
+		return cached.(*typeEncoder)
 	}
 	var (
 		ready   sync.WaitGroup
 		encoder encoderFunc
 	)
 	ready.Add(1)
-	cached, loaded := encoderCache.LoadOrStore(kind, encoderFunc(func(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
+	placeholder := &typeEncoder{kind: kind, placeholder: true, encode: func(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
 		ready.Wait()
 		return encoder(state, output, value, depth)
-	}))
-	if loaded {
-		return cached.(encoderFunc)
+	}}
+	if cached, loaded := encoderCache.LoadOrStore(kind, placeholder); loaded {
+		return cached.(*typeEncoder)
 	}
 	defer func() {
 		if encoder == nil {
 			// Construction panicked: release any waiters with an error and
 			// drop the placeholder, so the cache is not left poisoned.
-			encoderCache.CompareAndDelete(kind, cached)
+			encoderCache.CompareAndDelete(kind, placeholder)
 			encoder = func(*encodeState, []byte, reflect.Value, int) ([]byte, error) {
 				return nil, encodeError(ErrUnsupported, "no encoder for "+kind.String())
 			}
 		}
 		ready.Done()
 	}()
-	built := newEncoder(kind)
-	encoder = built
+	built := &typeEncoder{kind: kind, encode: newEncoder(kind)}
+	encoder = built.encode
 	encoderCache.Store(kind, built)
 	return built
 }
@@ -415,7 +444,7 @@ func (state *encodeState) appendAny(output []byte, value any, depth int) ([]byte
 		return appendBigInt(output, value), nil
 	}
 	reflected := reflect.ValueOf(value)
-	return encoderFor(reflected.Type())(state, output, reflected, depth)
+	return state.encoderFor(reflected.Type())(state, output, reflected, depth)
 }
 
 func encodeInterface(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
@@ -569,58 +598,102 @@ func newArrayEncoder(kind reflect.Type) encoderFunc {
 	}
 }
 
+// fieldPlan is one struct field prepared for encoding: where to find it,
+// its encoded key, and its encoder. Struct encoders iterate plans, built
+// once per type and sort order, so encoding locates each field with a
+// single reflect.Value.Field call.
+type fieldPlan struct {
+	direct   int   // field index for a field of the struct itself, or -1
+	path     []int // index path for a field promoted from an embedded struct
+	key      []byte
+	encode   encoderFunc
+	field    *structField
+	optional bool // the field may be omitted
+}
+
+// locate returns the planned field of value, reporting false when a nil
+// embedded pointer on its path leaves it absent.
+func (plan *fieldPlan) locate(value reflect.Value) (reflect.Value, bool) {
+	if plan.direct >= 0 {
+		return value.Field(plan.direct), true
+	}
+	return fieldByIndex(value, plan.path)
+}
+
 func newStructEncoder(kind reflect.Type) encoderFunc {
 	info, err := structFor(kind)
 	if err != nil {
 		return func(*encodeState, []byte, reflect.Value, int) ([]byte, error) { return nil, err }
 	}
 	fields := info.fields
-	encoders := make([]encoderFunc, len(fields))
-	optional := false
-	for position := range fields {
-		encoders[position] = encoderFor(fields[position].typ)
-		optional = optional || fields[position].omitEmpty || fields[position].omitZero || len(fields[position].index) > 1
+	plan := func(order []int) []fieldPlan {
+		plans := make([]fieldPlan, len(order))
+		for position, field := range order {
+			metadata := &fields[field]
+			plans[position] = fieldPlan{
+				direct: -1, path: metadata.index, key: metadata.encodedKey,
+				encode: encoderFor(metadata.typ), field: metadata,
+				optional: metadata.omitEmpty || metadata.omitZero || len(metadata.index) > 1,
+			}
+			if len(metadata.index) == 1 {
+				plans[position].direct = metadata.index[0]
+			}
+		}
+		return plans
 	}
 	if info.toArray {
+		declared := make([]int, len(fields))
+		for position := range declared {
+			declared[position] = position
+		}
+		plans := plan(declared)
 		return func(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
-			output = appendHeader(output, 4, uint64(len(fields)))
-			for position := range fields {
-				field, _ := fieldByIndex(value, fields[position].index)
+			output = appendHeader(output, 4, uint64(len(plans)))
+			for position := range plans {
+				field, _ := plans[position].locate(value)
 				var err error
-				if output, err = state.child(encoders[position], output, field, depth+1); err != nil {
+				if output, err = state.child(plans[position].encode, output, field, depth+1); err != nil {
 					return nil, err
 				}
 			}
 			return output, nil
 		}
 	}
+	plans := [2][]fieldPlan{plan(info.order[0]), plan(info.order[1])}
+	optional := false
+	for position := range plans[0] {
+		optional = optional || plans[0][position].optional
+	}
 	return func(state *encodeState, output []byte, value reflect.Value, depth int) ([]byte, error) {
-		order := info.order[state.options.Sort]
+		ordered := plans[state.options.Sort]
 		if !optional {
-			output = appendHeader(output, 5, uint64(len(fields)))
-			for _, position := range order {
-				output = append(output, fields[position].encodedKey...)
+			output = appendHeader(output, 5, uint64(len(ordered)))
+			for position := range ordered {
+				plan := &ordered[position]
+				output = append(output, plan.key...)
 				var err error
-				if output, err = state.child(encoders[position], output, value.Field(fields[position].index[0]), depth+1); err != nil {
+				if output, err = state.child(plan.encode, output, value.Field(plan.direct), depth+1); err != nil {
 					return nil, err
 				}
 			}
 			return output, nil
 		}
-		if len(fields) < 24 {
-			// The count cannot exceed len(fields), so the header is one byte:
-			// reserve it, encode the present fields in one pass, and patch it.
+		if len(ordered) < 24 {
+			// The count cannot exceed len(ordered), so the header is one
+			// byte: reserve it, encode the present fields in one pass, and
+			// patch it.
 			header := len(output)
 			output = append(output, 0xa0)
 			count := byte(0)
-			for _, position := range order {
-				field, ok := fieldByIndex(value, fields[position].index)
-				if !ok || fields[position].omit(field) {
+			for position := range ordered {
+				plan := &ordered[position]
+				field, ok := plan.locate(value)
+				if !ok || plan.optional && plan.field.omit(field) {
 					continue
 				}
-				output = append(output, fields[position].encodedKey...)
+				output = append(output, plan.key...)
 				var err error
-				if output, err = state.child(encoders[position], output, field, depth+1); err != nil {
+				if output, err = state.child(plan.encode, output, field, depth+1); err != nil {
 					return nil, err
 				}
 				count++
@@ -630,17 +703,19 @@ func newStructEncoder(kind reflect.Type) encoderFunc {
 		}
 		// Larger structs select the present fields first, so the header's
 		// width is known before any field is written.
-		present := make([]presentField, 0, len(fields))
-		for _, position := range order {
-			if field, ok := fieldByIndex(value, fields[position].index); ok && !fields[position].omit(field) {
+		present := make([]presentField, 0, len(ordered))
+		for position := range ordered {
+			plan := &ordered[position]
+			if field, ok := plan.locate(value); ok && !(plan.optional && plan.field.omit(field)) {
 				present = append(present, presentField{position: position, value: field})
 			}
 		}
 		output = appendHeader(output, 5, uint64(len(present)))
 		for _, entry := range present {
-			output = append(output, fields[entry.position].encodedKey...)
+			plan := &ordered[entry.position]
+			output = append(output, plan.key...)
 			var err error
-			if output, err = state.child(encoders[entry.position], output, entry.value, depth+1); err != nil {
+			if output, err = state.child(plan.encode, output, entry.value, depth+1); err != nil {
 				return nil, err
 			}
 		}
