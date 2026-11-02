@@ -247,8 +247,29 @@ func appendBool(output []byte, value bool) []byte {
 	return append(output, 0xf4)
 }
 
+// validText reports whether text is valid UTF-8, as utf8.ValidString does.
+// Text in COSE, CWT and WebAuthn is mostly short ASCII, for which testing
+// eight bytes at a time inline beats the call; the first word holding a
+// non-ASCII byte hands the rest to utf8.ValidString.
+func validText(text string) bool {
+	for len(text) >= 8 {
+		word := uint64(text[0]) | uint64(text[1])<<8 | uint64(text[2])<<16 | uint64(text[3])<<24 |
+			uint64(text[4])<<32 | uint64(text[5])<<40 | uint64(text[6])<<48 | uint64(text[7])<<56
+		if word&0x8080808080808080 != 0 {
+			return utf8.ValidString(text)
+		}
+		text = text[8:]
+	}
+	for position := range len(text) {
+		if text[position] >= utf8.RuneSelf {
+			return utf8.ValidString(text[position:])
+		}
+	}
+	return true
+}
+
 func (state *encodeState) appendText(output []byte, text string) ([]byte, error) {
-	if !utf8.ValidString(text) {
+	if !validText(text) {
 		return nil, encodeError(ErrInvalid, "invalid UTF-8")
 	}
 	if len(text) > maxEncodedItem-(len(output)-state.base)-9 {

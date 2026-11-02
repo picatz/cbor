@@ -27,7 +27,7 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
       - run: |
-          for target in FuzzDecode FuzzRoundTrip FuzzStream FuzzShortestFloat FuzzDiagnose FuzzSchema FuzzCOSE FuzzDeferral; do
+          for target in FuzzDecode FuzzRoundTrip FuzzStream FuzzShortestFloat FuzzDiagnose FuzzSchema FuzzCOSE FuzzDeferral FuzzValidText; do
             go test -run '^$' -fuzz "^${target}\$" -fuzztime 15s -parallel 2 .
           done
   wasm:

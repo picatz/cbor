@@ -49,6 +49,13 @@ const (
 // MarshalOptions: a plain value whose zero value is the default used by
 // Marshal and NewEncoder, and whose methods encode with it. Every mode writes
 // definite lengths and the shortest integer, length and tag headers.
+//
+// Every mode also validates what it writes, so its output always decodes.
+// In particular, a Go string that is not valid UTF-8 fails with ErrInvalid,
+// because CBOR text must be UTF-8 (RFC 8949 Section 3.1); arbitrary bytes
+// belong in a []byte, which encodes as a byte string.
+//
+// https://www.rfc-editor.org/rfc/rfc8949.html#section-3.1
 type EncoderOptions struct {
 	// Sort selects the map key order. Struct fields follow it too.
 	Sort SortMode

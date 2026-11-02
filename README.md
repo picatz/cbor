@@ -14,7 +14,7 @@ built for security protocols such as COSE, CWT, WebAuthn and CTAP2:
   without hand-written map walking.
 - **Fast.** Decodes COSE, CWT and CTAP2 payloads at parity with
   [fxamacker/cbor](https://github.com/fxamacker/cbor) v2.10, and encodes
-  within about 12%, with the same allocations and without `unsafe`;
+  within about 6–16%, with the same allocations and without `unsafe`;
   [see below](#performance).
 - **No dependencies**, and differentially tested against fxamacker/cbor.
 
@@ -210,15 +210,17 @@ significant.
 | Decode RFC 8392 CWT claims into a struct | 579 ns, 5 allocs | 612 ns, 5 allocs | ~ |
 | Decode an RFC 9052 EC2 COSE_Key | 480 ns, 4 allocs | 501 ns, 4 allocs | ~ |
 | Decode a CTAP2 `getInfo` response into `any` | 3.14 µs, 52 allocs | 3.11 µs, 52 allocs | ~ |
-| Encode CWT claims | 232 ns, 1 alloc | 204 ns, 1 alloc | +12% |
-| Encode a COSE_Key | 224 ns, 1 alloc | 198 ns, 1 alloc | +11% |
-| Encode the `getInfo` response from `any` | 1.43 µs, 1 alloc | 1.53 µs, 1 alloc | −7% |
-| Encode a `map[string]bool` | 548 ns, 1 alloc | 509 ns, 1 alloc | +7% |
+| Encode CWT claims | 205 ns, 1 alloc | 192 ns, 1 alloc | +6% |
+| Encode a COSE_Key | 229 ns, 1 alloc | 193 ns, 1 alloc | +16% |
+| Encode WebAuthn-shaped text (five 15–60 byte strings) | 270 ns, 1 alloc | 236 ns, 1 alloc | +13% |
+| Encode the `getInfo` response from `any` | 1.48 µs, 1 alloc | 1.54 µs, 1 alloc | −4% |
+| Encode a `map[string]bool` | 553 ns, 1 alloc | 507 ns, 1 alloc | +8% |
 
-Most of the encoding gap is UTF-8 validation: this package refuses to
-encode a Go string that is not valid UTF-8, because CBOR text must be,
-while fxamacker/cbor encodes it as written, producing items its own decoder
-rejects.
+Part of the encoding gap is UTF-8 validation, which text encoding checks
+eight bytes at a time: this package refuses to encode a Go string that is
+not valid UTF-8, because CBOR text must be, while fxamacker/cbor encodes it
+as written, producing items its own decoder rejects. There is deliberately
+no option to skip the check.
 
 Reproduce with `cd interop && go test -run '^$' -bench . -benchmem`, and
 compare revisions with [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat).
