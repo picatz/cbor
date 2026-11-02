@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"testing"
+	"time"
 
 	fx "github.com/fxamacker/cbor/v2"
 	"github.com/picatz/cbor"
@@ -56,6 +57,15 @@ var webauthn = registration{
 	UserName:    "alice.johnson@example.com",
 	DisplayName: "Alice Johnson — Platform Engineering",
 	Origin:      "https://login.example.com/webauthn/register?flow=passkey",
+}
+
+// optional has omitzero fields, two of them time.Time, which reports zero
+// through its IsZero method.
+type optional struct {
+	Issued  time.Time `cbor:"1,keyasint,omitzero"`
+	Count   int       `cbor:"2,keyasint,omitzero"`
+	Label   string    `cbor:"3,keyasint,omitzero"`
+	Expires time.Time `cbor:"4,keyasint,omitzero"`
 }
 
 var key = coseKey{Kty: 2, Kid: []byte("11"), Alg: -7, Crv: 1, X: bytes.Repeat([]byte{0xba}, 32), Y: bytes.Repeat([]byte{0xbe}, 32)}
@@ -147,6 +157,7 @@ func BenchmarkMarshal(b *testing.B) {
 		{"COSEKey", key},
 		{"GetInfoAny", getInfo},
 		{"WebAuthnText", webauthn},
+		{"OmitZero", &optional{Count: 3, Label: "x"}},
 		{"MapStringBool", map[string]bool{"rk": true, "up": true, "uv": false, "plat": false, "clientPin": true}},
 	}
 	for _, c := range cases {

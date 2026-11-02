@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 // decodeState converts items into Go values as the parser reads them.
@@ -24,6 +23,25 @@ type decodeState struct {
 	deterministic bool // require preferred serialization of bignums
 	pending       []pendingOp
 	scratch       DecoderOptions // options, when not the shared defaults
+
+	// lastKind and lastDecode remember the destination type this pooled
+	// state decoded last, so repeated decodes of one type skip the shared
+	// cache. Pooled states are per-processor, so nothing is contended.
+	lastKind   reflect.Type
+	lastDecode decoderFunc
+}
+
+// decoderFor returns the decoder for kind through the state's one-entry
+// cache.
+func (state *decodeState) decoderFor(kind reflect.Type) decoderFunc {
+	if kind == state.lastKind {
+		return state.lastDecode
+	}
+	entry := decoderEntry(kind)
+	if !entry.placeholder {
+		state.lastKind, state.lastDecode = kind, entry.decode
+	}
+	return entry.decode
 }
 
 // pendingOp is a deferred UnmarshalCBOR call on receiver, or when receiver
@@ -134,33 +152,18 @@ func valueKeys(kind reflect.Type) bool {
 // type's zero value. It consumes the item's remaining bytes.
 type decoderFunc func(state *decodeState, destination reflect.Value, value item, depth int) error
 
-// typeDecoder is a cache entry: a type and its decoder. Entries are
-// immutable, so the one looked up last can be published without a lock.
+// typeDecoder is a cache entry: a type and its decoder.
 type typeDecoder struct {
 	kind        reflect.Type
 	decode      decoderFunc
 	placeholder bool // decode waits for the type's decoder to be built
 }
 
-// decoderCache maps a reflect.Type to its *typeDecoder, and lastDecoder is
-// the entry looked up last, which a caller decoding one type repeatedly
-// finds without hashing.
-var (
-	decoderCache sync.Map
-	lastDecoder  atomic.Pointer[typeDecoder]
-)
+// decoderCache maps a reflect.Type to its *typeDecoder.
+var decoderCache sync.Map
 
 // decoderFor returns the decoder for a type, building it once.
-func decoderFor(kind reflect.Type) decoderFunc {
-	if last := lastDecoder.Load(); last != nil && last.kind == kind {
-		return last.decode
-	}
-	entry := decoderEntry(kind)
-	if !entry.placeholder {
-		lastDecoder.Store(entry)
-	}
-	return entry.decode
-}
+func decoderFor(kind reflect.Type) decoderFunc { return decoderEntry(kind).decode }
 
 // decoderEntry returns the cache entry for a type, building its decoder
 // once. Recursive types receive a placeholder entry while their own is under

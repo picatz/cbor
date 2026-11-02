@@ -49,6 +49,7 @@ type structField struct {
 	encodedKey []byte       // preferred serialization of the key
 	omitEmpty  bool
 	omitZero   bool
+	zeroer     zeroer // how omitzero tests the field, when it has IsZero
 	required   bool
 	tagged     bool // the key was named in a struct tag
 }
@@ -267,6 +268,7 @@ func newField(kind reflect.Type, options structOptions, field reflect.StructFiel
 			metadata.omitEmpty = true
 		case "omitzero":
 			metadata.omitZero = true
+			metadata.zeroer = zeroerFor(field.Type)
 		case "required":
 			metadata.required = true
 		case "toarray":
@@ -412,7 +414,35 @@ func (info *structInfo) fold(data []byte, key *item) int {
 	return selected
 }
 
-// omit reports whether an omitempty or omitzero field is left out.
+// zeroer records how a type reports zero for omitzero: through an
+// IsZero() bool method on the type or on its pointer, or by its Go zero
+// value. It is computed once per field.
+type zeroer uint8
+
+const (
+	zeroByValue   zeroer = iota // no IsZero method: compare with the zero value
+	zeroByMethod                // the type has IsZero
+	zeroByPointer               // only *T has IsZero, usable when addressable
+)
+
+// isZeroer is implemented by types such as time.Time.
+type isZeroer interface{ IsZero() bool }
+
+var isZeroerType = reflect.TypeFor[isZeroer]()
+
+func zeroerFor(kind reflect.Type) zeroer {
+	switch {
+	case kind.Implements(isZeroerType):
+		return zeroByMethod
+	case kind.Kind() != reflect.Pointer && kind.Kind() != reflect.Interface && reflect.PointerTo(kind).Implements(isZeroerType):
+		return zeroByPointer
+	}
+	return zeroByValue
+}
+
+// omit reports whether an omitempty or omitzero field is left out. An
+// omitzero field is omitted when its IsZero method reports true, or, as in
+// encoding/json, when it has none and holds its type's zero value.
 func (field *structField) omit(value reflect.Value) bool {
 	if field.omitEmpty && emptyValue(value) {
 		return true
@@ -420,16 +450,23 @@ func (field *structField) omit(value reflect.Value) bool {
 	if !field.omitZero {
 		return false
 	}
-	if value.Type().Implements(isZeroerType) {
-		if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil() {
+	switch field.zeroer {
+	case zeroByMethod:
+		if kind := value.Kind(); (kind == reflect.Pointer || kind == reflect.Interface) && value.IsNil() {
 			return true
 		}
-		return value.Interface().(interface{ IsZero() bool }).IsZero()
+		if value.CanAddr() {
+			// Calling through the pointer avoids boxing a copy of the value.
+			return value.Addr().Interface().(isZeroer).IsZero()
+		}
+		return value.Interface().(isZeroer).IsZero()
+	case zeroByPointer:
+		if value.CanAddr() {
+			return value.Addr().Interface().(isZeroer).IsZero()
+		}
 	}
 	return value.IsZero()
 }
-
-var isZeroerType = reflect.TypeFor[interface{ IsZero() bool }]()
 
 func emptyValue(value reflect.Value) bool {
 	switch value.Kind() {

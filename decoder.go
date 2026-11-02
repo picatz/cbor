@@ -249,7 +249,7 @@ func destinationValue(destination any) (reflect.Value, error) {
 // trailing data, has been validated.
 func store(target reflect.Value, state *decodeState) error {
 	destination := target.Elem()
-	decode := decoderFor(destination.Type())
+	decode := state.decoderFor(destination.Type())
 	inPlace := destination.IsZero()
 	replacement := destination
 	if !inPlace {

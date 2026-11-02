@@ -60,6 +60,16 @@ Changes since `f5df8ee`, the last revision before
 - Text strings are checked for valid UTF-8 eight bytes at a time before
   falling back to `unicode/utf8`, so encoding text-heavy structs is about
   12% faster; invalid UTF-8 still fails with `ErrInvalid`.
+- Struct encoders iterate precomputed field plans, locating each field
+  with one `reflect.Value.Field` call.
+- `omitzero` resolves a type's `IsZero` method once per field instead of on
+  every encode, and calls it through a pointer when the field is
+  addressable, so it no longer boxes values such as `time.Time`: encoding
+  such structs is about 4 to 5 times faster. As in `encoding/json`, an
+  `IsZero` method on the pointer type is honored for addressable fields.
+- The decoder and encoder remember the type they last handled on their
+  pooled state rather than in a shared variable, which is about 10% faster
+  when goroutines handle different types concurrently.
 - The densest adversarial input, one-byte items, allocates about one byte
   per input byte instead of about 182.
 

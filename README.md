@@ -12,9 +12,9 @@ built for security protocols such as COSE, CWT, WebAuthn and CTAP2:
 - **Schemas in struct tags.** Integer keys, required fields, unknown-field
   rejection, `toarray` structs and typed tags describe COSE and CWT messages
   without hand-written map walking.
-- **Fast.** Decodes COSE, CWT and CTAP2 payloads at parity with
-  [fxamacker/cbor](https://github.com/fxamacker/cbor) v2.10, and encodes
-  within about 6–16%, with the same allocations and without `unsafe`;
+- **Fast.** At parity with or faster than
+  [fxamacker/cbor](https://github.com/fxamacker/cbor) v2.10 on most COSE,
+  CWT and CTAP2 workloads, with the same allocations and without `unsafe`;
   [see below](#performance).
 - **No dependencies**, and differentially tested against fxamacker/cbor.
 
@@ -207,16 +207,17 @@ significant.
 
 | Benchmark | picatz/cbor | fxamacker/cbor | Time |
 |-----------|-------------|----------------|------|
-| Decode RFC 8392 CWT claims into a struct | 579 ns, 5 allocs | 612 ns, 5 allocs | ~ |
-| Decode an RFC 9052 EC2 COSE_Key | 480 ns, 4 allocs | 501 ns, 4 allocs | ~ |
-| Decode a CTAP2 `getInfo` response into `any` | 3.14 µs, 52 allocs | 3.11 µs, 52 allocs | ~ |
-| Encode CWT claims | 205 ns, 1 alloc | 192 ns, 1 alloc | +6% |
-| Encode a COSE_Key | 229 ns, 1 alloc | 193 ns, 1 alloc | +16% |
-| Encode WebAuthn-shaped text (five 15–60 byte strings) | 270 ns, 1 alloc | 236 ns, 1 alloc | +13% |
-| Encode the `getInfo` response from `any` | 1.48 µs, 1 alloc | 1.54 µs, 1 alloc | −4% |
-| Encode a `map[string]bool` | 553 ns, 1 alloc | 507 ns, 1 alloc | +8% |
+| Decode RFC 8392 CWT claims into a struct | 590 ns, 5 allocs | 589 ns, 5 allocs | ~ |
+| Decode an RFC 9052 EC2 COSE_Key | 472 ns, 4 allocs | 490 ns, 4 allocs | −4% |
+| Decode a CTAP2 `getInfo` response into `any` | 2.93 µs, 52 allocs | 3.10 µs, 52 allocs | ~ |
+| Encode CWT claims | 198 ns, 1 alloc | 196 ns, 1 alloc | ~ |
+| Encode a COSE_Key | 205 ns, 1 alloc | 195 ns, 1 alloc | +5% |
+| Encode WebAuthn-shaped text (five 15–60 byte strings) | 268 ns, 1 alloc | 221 ns, 1 alloc | +18% |
+| Encode `omitzero` fields, two of them `time.Time` | 189 ns, 1 alloc | 179 ns, 1 alloc | ~ |
+| Encode the `getInfo` response from `any` | 1.37 µs, 1 alloc | 1.50 µs, 1 alloc | −9% |
+| Encode a `map[string]bool` | 547 ns, 1 alloc | 529 ns, 1 alloc | +3% |
 
-Part of the encoding gap is UTF-8 validation, which text encoding checks
+Most of the remaining encoding gap is UTF-8 validation, which text encoding checks
 eight bytes at a time: this package refuses to encode a Go string that is
 not valid UTF-8, because CBOR text must be, while fxamacker/cbor encodes it
 as written, producing items its own decoder rejects. There is deliberately
