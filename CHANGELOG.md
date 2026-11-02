@@ -54,6 +54,9 @@ Changes since `f5df8ee`, the last revision before
 - Duplicate map keys are found through per-map key fingerprints on the
   stack, so a full comparison runs only for keys that may be equal; maps
   decoded into Go maps detect them through the map itself.
+- Encoding a struct with omitted fields writes it in one pass, and
+  encoding a reflected map reuses its iteration values, so every encoding
+  allocates only its result.
 - The densest adversarial input, one-byte items, allocates about one byte
   per input byte instead of about 182.
 

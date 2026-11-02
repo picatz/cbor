@@ -40,6 +40,29 @@ type encodeState struct {
 	// sorted, one level per nesting depth so nested maps never share.
 	scratch [][]byte
 	spans   [][]span
+
+	// iterated holds, per depth, the key and element values a reflected
+	// map is iterated into, so encoding a map allocates neither.
+	iterated []iteratedEntry
+}
+
+// iteratedEntry is the reusable key and element of one map depth.
+type iteratedEntry struct{ key, element reflect.Value }
+
+// iterationValues returns settable key and element values of the given
+// types for a map at depth.
+func (state *encodeState) iterationValues(depth int, keyType, elementType reflect.Type) (reflect.Value, reflect.Value) {
+	for len(state.iterated) <= depth {
+		state.iterated = append(state.iterated, iteratedEntry{})
+	}
+	entry := &state.iterated[depth]
+	if !entry.key.IsValid() || entry.key.Type() != keyType {
+		entry.key = reflect.New(keyType).Elem()
+	}
+	if !entry.element.IsValid() || entry.element.Type() != elementType {
+		entry.element = reflect.New(elementType).Elem()
+	}
+	return entry.key, entry.element
 }
 
 // span locates one encoded map entry in a scratch buffer.
@@ -67,6 +90,15 @@ func putEncodeState(state *encodeState) {
 		}
 		if cap(state.spans[depth]) > DefaultMaxValue/4 {
 			state.spans[depth] = nil
+		}
+	}
+	// Iteration values may still hold the caller's keys and elements, which
+	// a pooled state must not retain.
+	for depth := range state.iterated {
+		entry := &state.iterated[depth]
+		if entry.key.IsValid() {
+			entry.key.SetZero()
+			entry.element.SetZero()
 		}
 	}
 	state.base = 0
@@ -554,10 +586,30 @@ func newStructEncoder(kind reflect.Type) encoderFunc {
 			}
 			return output, nil
 		}
-		// Select the present fields in one pass, on the stack for typical
-		// structs, so each field is located and tested once.
-		var buffer [24]presentField
-		present := buffer[:0]
+		if len(fields) < 24 {
+			// The count cannot exceed len(fields), so the header is one byte:
+			// reserve it, encode the present fields in one pass, and patch it.
+			header := len(output)
+			output = append(output, 0xa0)
+			count := byte(0)
+			for _, position := range order {
+				field, ok := fieldByIndex(value, fields[position].index)
+				if !ok || fields[position].omit(field) {
+					continue
+				}
+				output = append(output, fields[position].encodedKey...)
+				var err error
+				if output, err = state.child(encoders[position], output, field, depth+1); err != nil {
+					return nil, err
+				}
+				count++
+			}
+			output[header] |= count
+			return output, nil
+		}
+		// Larger structs select the present fields first, so the header's
+		// width is known before any field is written.
+		present := make([]presentField, 0, len(fields))
 		for _, position := range order {
 			if field, ok := fieldByIndex(value, fields[position].index); ok && !fields[position].omit(field) {
 				present = append(present, presentField{position: position, value: field})
@@ -612,7 +664,7 @@ func newMapEncoder(kind reflect.Type) encoderFunc {
 			return append(output, 0xa0), nil
 		}
 		entries := state.beginMap(depth)
-		key, element := reflect.New(keyType).Elem(), reflect.New(elementType).Elem()
+		key, element := state.iterationValues(depth, keyType, elementType)
 		var iterator reflect.MapIter
 		iterator.Reset(value)
 		for iterator.Next() {
